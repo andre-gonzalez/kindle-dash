@@ -277,11 +277,12 @@ def parse_events(calendars, start):
     Time-sorted, all-day events first. An event that is on more than one
     calendar (e.g. a meeting invite) shows once. A timed event that began
     before today (e.g. overnight) shows as '→HH:MM' (its end) with the all-day ones.
+    An event with no title (e.g. from a free/busy-only share) shows as 'busy'.
     """
     out = {}
     for ev in (ev for data in calendars for ev in data):
         so = ev.get("start", {})
-        summary = ev.get("summary", "(no title)")
+        summary = ev.get("summary") or "busy"  # free/busy-only shares have no title
         dt = _local(so.get("dateTime")) if "dateTime" in so else None
         if dt and dt < start:
             end = _local(ev.get("end", {}).get("dateTime"))

@@ -127,6 +127,8 @@ class RenderContract(unittest.TestCase):
         ]
         work = [
             {"start": at(9.5), "summary": "Standup"},
+            # A free/busy-only share gives no title.
+            {"start": at(11), "summary": ""},
             # The same invite on both calendars shows once.
             {"start": at(15), "summary": "Gym"},
         ]
@@ -136,6 +138,7 @@ class RenderContract(unittest.TestCase):
             ("all day", "Birthday"),
             ("→05:30", "Sleep"),
             ("09:30", "Standup"),
+            ("11:00", "busy"),
             ("15:00", "Gym"),
         ])
 
