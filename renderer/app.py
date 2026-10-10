@@ -198,7 +198,7 @@ def fetch_events():
         start=start.isoformat(),
         end=(start + timedelta(days=1)).isoformat(),
     )
-    if not data:
+    if data is None:  # fetch failed; [] is a real "nothing today"
         return None
     out = []
     for ev in data:
