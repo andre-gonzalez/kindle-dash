@@ -29,9 +29,10 @@ Optional. Create a long-lived token: HA → Profile → Security → Long-lived 
 | `HA_SUN_ENTITY` | `sun.sun` | sunrise/sunset |
 | `FORECAST_DAYS` | `3` | days in the forecast strip |
 | `RAIN_HOURS` | `12` | hours in the rain chart (from the current hour) |
+| `RAIN_LAT` / `RAIN_LON` | HA home location | location for the Open-Meteo rain fallback (below) |
 | `DASH_MAX_EVENTS` | `4` | agenda rows |
 
-Forecast uses HA's `weather.get_forecasts` service; if your weather integration doesn't support daily forecasts, the strip just hides. The rain chart uses the same service with `type: hourly` and reads `precipitation_probability`; if the integration has no hourly forecast it shows `rain n/a`, and an hour with no probability shows `—`.
+Forecast uses HA's `weather.get_forecasts` service; if your weather integration doesn't support daily forecasts, the strip just hides. The rain chart uses the same service with `type: hourly` and reads `precipitation_probability`. Some integrations (e.g. the default Met.no) give only the rain amount, not the probability; then the chart gets the probability from [Open-Meteo](https://open-meteo.com) instead (free, no API key), at HA's home location or `RAIN_LAT`/`RAIN_LON`. This is the only call that leaves your network for weather. If neither source answers it shows `rain n/a`, and an hour with no probability shows `—`.
 
 ## Claude usage (5h / 7d / Extra)
 

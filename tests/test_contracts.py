@@ -152,6 +152,36 @@ class RenderContract(unittest.TestCase):
         ):
             self.assertIsNone(app.fetch_events())
 
+    def test_open_meteo_parses_rain_probability(self):
+        data = {"hourly": {
+            "time": [int(NOW.timestamp()), int(NOW.timestamp()) + 3600],
+            "precipitation_probability": [41, None],
+        }}
+        result = app.parse_open_meteo(data)
+        self.assertEqual([pct for _, pct in result], [41, None])
+        self.assertEqual(result[0][0], NOW)
+        self.assertIsNone(app.parse_open_meteo({}))
+
+    def test_hourly_falls_back_to_open_meteo_without_probability(self):
+        # Met.no-style hourly forecast: rain amount, no probability.
+        ha_hourly = {"service_response": {"weather.home": {"forecast": [
+            {"datetime": "2026-07-19T18:00:00+00:00", "precipitation": 0.4},
+        ]}}}
+        meteo = [(NOW, 55)]
+
+        def fake_ha(method, path, body=None, **params):
+            return ha_hourly if path.endswith("get_forecasts") else {"latitude": 1, "longitude": 2}
+
+        with (
+            mock.patch.object(app, "HA_WEATHER_ENTITY", "weather.home"),
+            mock.patch.object(app, "_ha", side_effect=fake_ha),
+            mock.patch.object(app, "requests") as req,
+            mock.patch.object(app, "parse_open_meteo", return_value=meteo),
+        ):
+            self.assertEqual(app.fetch_hourly(), meteo)
+        params = req.get.call_args.kwargs["params"]
+        self.assertEqual((params["latitude"], params["longitude"]), (1, 2))
+
     def test_rain_chart_skips_past_hours(self):
         now = datetime.now(app.TZINFO).replace(minute=0, second=0, microsecond=0)
         past = [(now - timedelta(hours=2), 100), (now - timedelta(hours=1), 100)]

@@ -67,6 +67,12 @@ HA_CALENDAR_ENTITIES = [
 HA_SUN_ENTITY = os.environ.get("HA_SUN_ENTITY", "sun.sun")
 FORECAST_DAYS = int(os.environ.get("FORECAST_DAYS", "3"))
 RAIN_HOURS = int(os.environ.get("RAIN_HOURS", "12"))  # columns in the rain chart
+# Rain chance falls back to Open-Meteo (free, no key) when the HA weather entity
+# has no hourly precipitation_probability (e.g. Met.no). The location defaults
+# to HA's home coordinates; RAIN_LAT/RAIN_LON override it.
+OPEN_METEO_URL = os.environ.get("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
+RAIN_LAT = os.environ.get("RAIN_LAT", "")
+RAIN_LON = os.environ.get("RAIN_LON", "")
 MAX_EVENTS = int(os.environ.get("DASH_MAX_EVENTS", "4"))
 DASH_POLL_MIN = int(os.environ.get("DASH_POLL_MIN", "5"))  # HA refresh cadence
 
@@ -200,17 +206,60 @@ def parse_hourly(resp, entity):
     return out or None
 
 
-def fetch_hourly():
-    """Hourly rain probability (see parse_hourly), or None."""
-    if not HA_WEATHER_ENTITY:
+def parse_open_meteo(data):
+    """[(local_dt, rain_pct-or-None)] from an Open-Meteo unixtime response, or None."""
+    try:
+        h = data["hourly"]
+        pairs = list(zip(h["time"], h["precipitation_probability"]))
+    except Exception:
         return None
-    resp = _ha(
-        "POST",
-        "/api/services/weather/get_forecasts",
-        {"entity_id": HA_WEATHER_ENTITY, "type": "hourly"},
-        return_response="true",
-    )
-    return parse_hourly(resp, HA_WEATHER_ENTITY)
+    out = [
+        (datetime.fromtimestamp(t, TZINFO), round(p) if isinstance(p, (int, float)) else None)
+        for t, p in pairs
+    ]
+    return out or None
+
+
+def fetch_open_meteo():
+    """Hourly rain probability from Open-Meteo (see parse_open_meteo), or None."""
+    if RAIN_LAT and RAIN_LON:
+        lat, lon = RAIN_LAT, RAIN_LON
+    else:
+        cfg = _ha("GET", "/api/config") or {}
+        lat, lon = cfg.get("latitude"), cfg.get("longitude")
+    if lat is None or lon is None:
+        return None
+    try:
+        r = requests.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": lat, "longitude": lon,
+                "hourly": "precipitation_probability", "timeformat": "unixtime",
+                "forecast_days": 1 + -(-RAIN_HOURS // 24),  # today + enough to cover RAIN_HOURS
+            },
+            timeout=8,
+        )
+        r.raise_for_status()
+        return parse_open_meteo(r.json())
+    except Exception as e:
+        print(f"[open-meteo] fetch failed: {e}", flush=True)
+        return None
+
+
+def fetch_hourly():
+    """Hourly rain probability: the HA weather entity, else Open-Meteo. Or None."""
+    hours = None
+    if HA_WEATHER_ENTITY:
+        resp = _ha(
+            "POST",
+            "/api/services/weather/get_forecasts",
+            {"entity_id": HA_WEATHER_ENTITY, "type": "hourly"},
+            return_response="true",
+        )
+        hours = parse_hourly(resp, HA_WEATHER_ENTITY)
+    if hours and any(pct is not None for _, pct in hours):
+        return hours
+    return fetch_open_meteo() or hours
 
 
 def fetch_sun():
@@ -941,7 +990,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"kindle-dash on :8080  ({KINDLE_W}x{KINDLE_H}, tz={TZ})", flush=True)
-    if HA_BASE_URL:
+    if HA_BASE_URL or (RAIN_LAT and RAIN_LON):
         threading.Thread(target=ha_poll_loop, daemon=True).start()
     if CLAUDE_REFRESH_TOKEN or os.path.exists(TOKEN_FILE):
         threading.Thread(target=usage_poll_loop, daemon=True).start()
