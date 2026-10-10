@@ -830,7 +830,7 @@ def w_sun(d, box):
 def w_rain(d, box):
     """Hour-by-hour rain probability: one bar per hour, % above, hour below."""
     x, y, w, h = box
-    d.text((x, y), "RAIN CHANCE %", font=_font(True, h * 0.14), fill=0)
+    d.text((x, y), "RAIN CHANCE", font=_font(True, h * 0.14), fill=0)
     f = _font(False, h * 0.14)
     now = datetime.now(TZINFO).replace(minute=0, second=0, microsecond=0)
     hours = [(dt, pct) for dt, pct in HA_DATA["hourly"] or [] if dt >= now][:RAIN_HOURS]
@@ -842,13 +842,17 @@ def w_rain(d, box):
     cw = w / RAIN_HOURS
     bw = cw * 0.6
     top, base = y + h * 0.40, y + h * 0.80
+    # Shrink the value font until the widest label ("100%") fits its column.
+    vf = f
+    while vf.size > 8 and d.textlength("100%", font=vf) > cw * 0.92:
+        vf = _font(False, vf.size - 1)
     for i, (dt, pct) in enumerate(hours):
         cx = x + cw * (i + 0.5)
         d.rectangle((cx - bw / 2, top, cx + bw / 2, base), outline=0, width=1)  # 100% track
         if pct:
             d.rectangle((cx - bw / 2, base - (base - top) * min(pct, 100) / 100, cx + bw / 2, base), fill=0)
-        label = "—" if pct is None else str(pct)
-        d.text((cx, y + h * 0.22), label, font=f, fill=0, anchor="ma")
+        label = "—" if pct is None else f"{pct}%"
+        d.text((cx, y + h * 0.22), label, font=vf, fill=0, anchor="ma")
         d.text((cx, base + h * 0.05), dt.strftime("%H"), font=f, fill=0, anchor="ma")
     d.line((x, base, x + cw * len(hours), base), fill=0, width=2)
 
