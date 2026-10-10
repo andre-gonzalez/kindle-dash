@@ -32,7 +32,8 @@ exec >>"$LOG" 2>&1
 # fbink if available (override with FBINK=/path), else the built-in eips.
 FBINK="${FBINK:-fbink}"
 if ! command -v "$FBINK" >/dev/null 2>&1 && [ ! -x "$FBINK" ]; then
-  for c in /mnt/us/fbink /mnt/us/bin/fbink /mnt/us/koreader/fbink \
+  # Not /mnt/us/koreader/fbink: KOReader bundles a build without image support.
+  for c in /mnt/us/fbink /mnt/us/bin/fbink \
            /mnt/us/extensions/fbink/bin/fbink /usr/local/bin/fbink; do
     [ -x "$c" ] && FBINK="$c" && break
   done
@@ -49,11 +50,14 @@ fi
 paint() {  # $1 = 1 for a full flashing refresh, 0 for a fast partial one
   if [ "$PAINT" = fbink ]; then
     if [ "$1" = 1 ]; then "$FBINK" -c -f -g file="$IMG"
-    else "$FBINK" -g file="$IMG"; fi
-  else
-    [ "$1" = 1 ] && eips -c          # clear (de-ghost) on the full cycle
-    eips -g "$IMG"
+    else "$FBINK" -g file="$IMG"; fi && return
+    # Some fbink builds are compiled without image support ("Image support is
+    # disabled in this FBInk build!") — fall back to eips for good.
+    echo "fbink at $FBINK can't draw images; falling back to eips"
+    PAINT=eips
   fi
+  [ "$1" = 1 ] && eips -c          # clear (de-ghost) on the full cycle
+  eips -g "$IMG"
 }
 
 # Clean shutdown: on stop (KUAL Stop / pkill -TERM), restore the screensaver and
