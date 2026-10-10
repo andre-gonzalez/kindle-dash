@@ -88,6 +88,6 @@ DASH_PROXY="${DASH_PROXY:-http://127.0.0.1:1056}"
 
 Use the same URL at home and away: at home Tailscale connects directly over the LAN, so there is no extra hop.
 
-KOReader starts `tailscaled` when it opens, but after a reboot straight into KUAL nothing has. So when `DASH_PROXY` is set and `tailscaled` isn't running, `dashboard.sh` starts it from the plugin's binaries (`TS_BIN`, default `/mnt/us/koreader/plugins/tailscale.koplugin/bin`). It uses the plugin's own start script and state directory, so the Kindle keeps its node identity, and resumes the last connected/disconnected state rather than forcing `tailscale up`. **Stop** leaves `tailscaled` running — KOReader shares it, and it idles frozen while the device sleeps.
+KOReader starts `tailscaled` when it opens, but after a reboot straight into KUAL nothing has. So when `DASH_PROXY` is set and `tailscaled` isn't running, `dashboard.sh` starts it from the plugin's binaries (`TS_BIN`, default `/mnt/us/koreader/plugins/tailscale.koplugin/bin`). It runs the plugin's `tailscaled` with the same flags and state directory as the plugin, so the Kindle keeps its node identity, and the daemon resumes the last connected/disconnected state (no `tailscale up`). If you disconnected Tailscale in KOReader, connect it there again. **Stop** leaves `tailscaled` running — KOReader shares it, and it idles frozen while the device sleeps.
 
 Lock it down with a Tailscale ACL so the Kindle can reach only the renderer — see [SECURITY.md](SECURITY.md#network-exposure).
