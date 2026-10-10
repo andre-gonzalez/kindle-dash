@@ -18,7 +18,8 @@ concurrency:
 
 jobs:
   publish:
-    if: github.event.pull_request.merged == true
+    # Upstream only: a fork publishes with publish-fork.yml instead.
+    if: github.repository == 'ErikBPF/kindle-dash' && github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
