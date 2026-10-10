@@ -91,6 +91,6 @@ Parses the `rollingUsage` / `weeklyUsage` / `monthlyUsage` objects (`usagePercen
 |---|---|---|
 | `DASH_URL` | `http://CHANGE-ME.lan/dash.png?rotate=90` | where the device fetches; set to your renderer |
 | `DASH_PROXY` | — | proxy for the fetch. Set to `http://127.0.0.1:1056` (the KOReader Tailscale plugin's proxy) to fetch over your tailnet, e.g. `DASH_URL=http://servarr:8810/dash.png`. Also starts `tailscaled` if it isn't running. Blank = plain LAN fetch. See [INSTALLATION.md](INSTALLATION.md#3-away-from-home-tailscale). |
-| `TS_BIN` | `/mnt/us/koreader/plugins/tailscale.koplugin/bin` | where the plugin keeps `tailscale`, `tailscaled` and `start_tailscale.sh`; only used when `DASH_PROXY` is set |
+| `TS_BIN` | `/mnt/us/koreader/plugins/tailscale.koplugin/bin` | where the plugin keeps `tailscaled` and its state; only used when `DASH_PROXY` is set |
 | `FULL_EVERY` | `30` | full (flashing) de-ghost refresh every N minute-cycles |
 | `LOG` | `/tmp/kindle-dash.log` | script log (kept off-screen) |
