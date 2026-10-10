@@ -781,7 +781,7 @@ def w_rain(d, box):
     top, base = y + h * 0.40, y + h * 0.80
     for i, (dt, pct) in enumerate(hours):
         cx = x + cw * (i + 0.5)
-        d.rectangle((cx - bw / 2, top, cx + bw / 2, base), fill=220)  # 100% track
+        d.rectangle((cx - bw / 2, top, cx + bw / 2, base), outline=0, width=1)  # 100% track
         if pct:
             d.rectangle((cx - bw / 2, base - (base - top) * min(pct, 100) / 100, cx + bw / 2, base), fill=0)
         label = "—" if pct is None else str(pct)
