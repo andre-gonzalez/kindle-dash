@@ -52,6 +52,17 @@ Set `OPENCODE_WORKSPACE_ID` + `OPENCODE_AUTH_COOKIE` (both opt-in; blank = panel
 
 The renderer serves **plain HTTP** with **no authentication** — because the Kindle can't do TLS. Keep it on a trusted LAN. The reverse-proxy example restricts the vhost to private ranges (`allow`/`deny`); adjust to your network. Don't expose `/dash.png` to the internet — it may reveal your calendar, location (via weather), and usage.
 
+To use the Kindle away from home, reach the renderer over a **Tailscale tailnet** instead of opening a port (see [INSTALLATION.md](INSTALLATION.md#3-away-from-home-tailscale)). Tailnet traffic is WireGuard-encrypted, so plain HTTP is fine there. Add an ACL so the Kindle can reach only the renderer, e.g. with the Kindle tagged `tag:kindle`:
+
+```jsonc
+"hosts": { "kindle-dash": "100.x.y.z" },   // the renderer's tailnet IP
+"acls": [
+  { "action": "accept", "src": ["tag:kindle"], "dst": ["kindle-dash:8810"] }
+]
+```
+
+If the Kindle is lost, remove it from the tailnet in the Tailscale admin console.
+
 ## Published image verification
 
 Releases are built from protected `main` merge commits. The workflow publishes

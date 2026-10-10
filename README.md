@@ -45,7 +45,7 @@ A 6-inch e-ink screen is the *perfect* ambient display: paper-like, sunlight-rea
                 └───────────────────────────────────────┘
 ```
 
-**Where it runs:** the renderer is just a container — put it on any always-on machine the Kindle can reach over your LAN. The device must be able to fetch it over **plain HTTP** (no TLS), so keep it local. You point the Kindle at it with a single variable, **`DASH_URL`**.
+**Where it runs:** the renderer is just a container — put it on any always-on machine the Kindle can reach over your LAN. The device must be able to fetch it over **plain HTTP** (no TLS), so keep it local — or reach it over a [Tailscale](https://tailscale.com) tailnet to take the Kindle away from home (see [INSTALLATION.md](INSTALLATION.md#3-away-from-home-tailscale)). You point the Kindle at it with a single variable, **`DASH_URL`**.
 
 The renderer is **slot-based**: `render()` lays out boxes and hands each to a widget (`fetch()` + `draw(d, box)`). Adding a panel is a small function — see [WIDGETS.md](WIDGETS.md).
 

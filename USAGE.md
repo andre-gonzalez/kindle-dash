@@ -42,5 +42,7 @@ Have your jailbreak's boot hook run `sh /mnt/us/extensions/kindledash/start.sh` 
 | Browser **redirects to https** | your browser auto-upgrades http→https; the device (curl) is unaffected. Add a `:443` vhost if you want browser access. |
 | `(stale)` on a usage panel | renderer hasn't fetched recently — check `docker logs kindle-dash`. Claude/Codex: usually a token issue. **opencode**: its cookie expired (it has no refresh) — re-capture with `tools/opencode-capture.py` and re-seed (see [SECURITY.md](SECURITY.md)). |
 | A panel shows a placeholder | its source isn't configured (or that fetch failed) — see [CONFIGURATION.md](CONFIGURATION.md). |
+| Works at home, **frozen away from home** | the fetch isn't going over Tailscale — set `DASH_PROXY` and use the renderer's tailnet name in `DASH_URL` (see [INSTALLATION.md](INSTALLATION.md#3-away-from-home-tailscale)). |
+| Frozen **after a reboot** (Tailscale) | `tailscaled` didn't start. `cat /tmp/kindle-dash.log` — "no tailscaled in …" means `TS_BIN` is wrong or the plugin isn't installed; otherwise read `$TS_BIN/tailscaled.log`. Opening KOReader once also starts it. |
 
 Device logs go to `/tmp/kindle-dash.log` (kept off-screen). Renderer logs: `docker logs kindle-dash`.
