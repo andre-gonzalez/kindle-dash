@@ -113,6 +113,45 @@ class RenderContract(unittest.TestCase):
         self.assertIsNone(app.parse_hourly(None, "weather.home"))
         self.assertIsNone(app.parse_hourly(resp, "weather.other"))
 
+    def test_agenda_merges_calendars(self):
+        start = datetime(2026, 7, 19, tzinfo=app.TZINFO)
+
+        def at(hours):
+            return {"dateTime": (start + timedelta(hours=hours)).isoformat()}
+
+        personal = [
+            {"start": at(15), "summary": "Gym"},
+            {"start": {"date": "2026-07-19"}, "summary": "Birthday"},
+            # Began yesterday: shows its end time, sorted with the all-day events.
+            {"start": at(-2), "end": at(5.5), "summary": "Sleep"},
+        ]
+        work = [
+            {"start": at(9.5), "summary": "Standup"},
+            # The same invite on both calendars shows once.
+            {"start": at(15), "summary": "Gym"},
+        ]
+        with mock.patch.object(app, "MAX_EVENTS", 10):
+            result = app.parse_events([personal, work], start)
+        self.assertEqual(result, [
+            ("all day", "Birthday"),
+            ("→05:30", "Sleep"),
+            ("09:30", "Standup"),
+            ("15:00", "Gym"),
+        ])
+
+    def test_agenda_keeps_calendars_that_fetched(self):
+        work = [{"start": {"date": "2026-07-19"}, "summary": "Offsite"}]
+        with (
+            mock.patch.object(app, "HA_CALENDAR_ENTITIES", ["calendar.a", "calendar.b"]),
+            mock.patch.object(app, "_ha", side_effect=[None, work]),
+        ):
+            self.assertEqual(app.fetch_events(), [("all day", "Offsite")])
+        with (
+            mock.patch.object(app, "HA_CALENDAR_ENTITIES", ["calendar.a", "calendar.b"]),
+            mock.patch.object(app, "_ha", return_value=None),
+        ):
+            self.assertIsNone(app.fetch_events())
+
     def test_rain_chart_skips_past_hours(self):
         now = datetime.now(app.TZINFO).replace(minute=0, second=0, microsecond=0)
         past = [(now - timedelta(hours=2), 100), (now - timedelta(hours=1), 100)]

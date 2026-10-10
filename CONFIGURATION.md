@@ -25,7 +25,7 @@ Optional. Create a long-lived token: HA → Profile → Security → Long-lived 
 | `HA_BASE_URL` | `http://192.168.1.5:8123` | all HA panels (blank = all off) |
 | `HA_TOKEN` | `eyJ…` | auth |
 | `HA_WEATHER_ENTITY` | `weather.home` | weather, the forecast strip, **and** the rain chart |
-| `HA_CALENDAR_ENTITY` | `calendar.personal` | agenda (blank = hidden) |
+| `HA_CALENDAR_ENTITY` | `calendar.personal,calendar.work` | agenda (blank = hidden). Comma list: events from every calendar merge into one time-sorted list, and an event on more than one calendar shows once. |
 | `HA_SUN_ENTITY` | `sun.sun` | sunrise/sunset |
 | `FORECAST_DAYS` | `3` | days in the forecast strip |
 | `RAIN_HOURS` | `12` | hours in the rain chart (from the current hour) |

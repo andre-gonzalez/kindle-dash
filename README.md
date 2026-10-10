@@ -15,7 +15,7 @@ No glowing rectangle, no app, no cloud account. A tiny container renders a grays
 - **Clock + date** — big, 24-hour, minute-aligned so it never drifts.
 - **Weather now** — temperature, condition, "feels like", drawn icon (no icon fonts to ship).
 - **Forecast** — next N days (hi/lo + icon).
-- **Agenda** — today's calendar events.
+- **Agenda** — today's events, merged from one or more calendars.
 - **Rain** — chance of rain for each of the next N hours, as a bar chart.
 - **Sun** — sunrise/sunset.
 - **AI usage** — live subscription limits side by side: Claude (5h/7d/Extra), Codex (available windows/Credits), opencode Go (5h/Week/Month). Columns size themselves to however many you enable.
