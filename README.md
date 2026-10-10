@@ -1,6 +1,6 @@
 # kindle-dash
 
-Turn a dead/old jailbroken Kindle into a calm, glare-free **e-ink wall dashboard** — clock, weather, a 3-day forecast, today's agenda, sun & moon, and your live **AI subscription usage** (Claude · Codex · opencode) — rendered server-side and painted by the device on a timer.
+Turn a dead/old jailbroken Kindle into a calm, glare-free **e-ink wall dashboard** — clock, weather, a 3-day forecast, hour-by-hour rain chance, today's agenda, sunrise/sunset, and your live **AI subscription usage** (Claude · Codex · opencode) — rendered server-side and painted by the device on a timer.
 
 > *Your Kindle didn't die. It ascended into furniture.*
 
@@ -16,7 +16,8 @@ No glowing rectangle, no app, no cloud account. A tiny container renders a grays
 - **Weather now** — temperature, condition, "feels like", drawn icon (no icon fonts to ship).
 - **Forecast** — next N days (hi/lo + icon).
 - **Agenda** — today's calendar events.
-- **Sun & moon** — sunrise/sunset + a computed moon-phase glyph.
+- **Rain** — chance of rain for each of the next N hours, as a bar chart.
+- **Sun** — sunrise/sunset.
 - **AI usage** — live subscription limits side by side: Claude (5h/7d/Extra), Codex (available windows/Credits), opencode Go (5h/Week/Month). Columns size themselves to however many you enable.
 
 Every panel is optional. A panel with no data source configured just renders a quiet placeholder — never a broken image.
