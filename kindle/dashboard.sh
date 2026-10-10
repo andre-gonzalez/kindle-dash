@@ -13,6 +13,15 @@
 # dark mode, which widgets — are set on the RENDERER (container env), so the
 # device just opens the bare link.
 URL="${DASH_URL:-http://CHANGE-ME.lan/dash.png}"
+# Optional: fetch over your Tailscale tailnet, so the dashboard also works away
+# from home. Needs the KOReader tailscale plugin, whose tailscaled always serves
+# an HTTP proxy on 127.0.0.1:1056 (TUN or userspace mode). The proxy resolves
+# MagicDNS names, e.g. DASH_URL=http://servarr:8810/dash.png with
+# DASH_PROXY=http://127.0.0.1:1056. Empty = plain LAN fetch, no Tailscale.
+DASH_PROXY="${DASH_PROXY:-}"
+# The plugin's binaries. KOReader starts tailscaled on open; after a reboot
+# straight into KUAL nothing has, so we start it from here (see ensure_tailscale).
+TS_BIN="${TS_BIN:-/mnt/us/koreader/plugins/tailscale.koplugin/bin}"
 IMG="/tmp/dash.png"
 LOG="${LOG:-/tmp/kindle-dash.log}"
 FULL_EVERY=30      # full flashing refresh every N cycles (here: 30 min) to de-ghost
@@ -60,6 +69,48 @@ paint() {  # $1 = 1 for a full flashing refresh, 0 for a fast partial one
   eips -g "$IMG"
 }
 
+# --- Tailscale (only when DASH_PROXY is set) -------------------------------
+# Start tailscaled the way the KOReader plugin does, if nothing has yet. Same
+# state dir so the Kindle keeps its node identity: /mnt/us is FAT32 (no chmod),
+# so the plugin keeps state in tmpfs, seeded from bin/. Daemon-only launch: it
+# resumes its saved up/down state, never forces `tailscale up`. Userspace mode
+# always — we only need the proxy, and it avoids flaky e-reader TUN drivers.
+# Left running on Stop: KOReader shares it, and it idles frozen while asleep.
+ensure_tailscale() {
+  [ -n "$DASH_PROXY" ] || return 0
+  pgrep tailscaled >/dev/null 2>&1 && return 0
+  if [ ! -x "$TS_BIN/tailscaled" ] || [ ! -x "$TS_BIN/tailscale" ] ||
+     [ ! -f "$TS_BIN/start_tailscale.sh" ]; then
+    echo "DASH_PROXY is set but no tailscaled in $TS_BIN; is the plugin installed?"
+    return 0
+  fi
+  statedir="$TS_BIN"
+  if ! { touch "$TS_BIN/.chmod_test" && chmod 0600 "$TS_BIN/.chmod_test"; } 2>/dev/null; then
+    statedir=/tmp/tailscale
+    mkdir -p "$statedir"
+    for f in tailscaled.state tailscaled.log.conf; do
+      # don't clobber a newer tmpfs copy from earlier this boot
+      [ -f "$TS_BIN/$f" ] && [ ! -f "$statedir/$f" ] && cp -f "$TS_BIN/$f" "$statedir/$f"
+    done
+  fi
+  rm -f "$TS_BIN/.chmod_test" 2>/dev/null
+  # the proxy binds 127.0.0.1; some firmwares leave loopback down
+  ifconfig lo 2>/dev/null | grep -q '127\.0\.0\.1' ||
+    ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
+  echo "starting tailscaled from $TS_BIN (state in $statedir)"
+  TS_STATEDIR="$statedir" TS_DAEMON_ONLY=1 \
+    TS_TUN_FLAG=--tun=userspace-networking TS_NETWORK_MODE="userspace (kindle-dash)" \
+    sh "$TS_BIN/start_tailscale.sh" || echo "tailscaled start failed; see $TS_BIN/tailscaled.log"
+}
+
+fetch() {
+  if [ -n "$DASH_PROXY" ]; then
+    curl -s -m 30 -x "$DASH_PROXY" -o "$IMG" "$URL"
+  else
+    curl -s -m 30 -o "$IMG" "$URL"
+  fi
+}
+
 # Clean shutdown: on stop (KUAL Stop / pkill -TERM), restore the screensaver and
 # clear the screen so the Kindle returns to normal without a reboot.
 cleanup() {
@@ -80,7 +131,9 @@ fi
 
 i=0
 while true; do
-  if curl -s -m 30 -o "$IMG" "$URL"; then
+  # cheap when it's already up; restarts it if it died (or after a reboot)
+  ensure_tailscale
+  if fetch; then
     if [ $((i % FULL_EVERY)) -eq 0 ]; then paint 1; else paint 0; fi
   fi
   # re-assert each cycle — the framework can reset it after a while
