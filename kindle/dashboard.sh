@@ -70,17 +70,17 @@ paint() {  # $1 = 1 for a full flashing refresh, 0 for a fast partial one
 }
 
 # --- Tailscale (only when DASH_PROXY is set) -------------------------------
-# Start tailscaled the way the KOReader plugin does, if nothing has yet. Same
-# state dir so the Kindle keeps its node identity: /mnt/us is FAT32 (no chmod),
-# so the plugin keeps state in tmpfs, seeded from bin/. Daemon-only launch: it
-# resumes its saved up/down state, never forces `tailscale up`. Userspace mode
-# always — we only need the proxy, and it avoids flaky e-reader TUN drivers.
+# Start tailscaled the way the KOReader plugin does, if nothing has yet. We run
+# the binary directly rather than the plugin's start script, whose interface
+# differs between plugin versions. Same state dir as the plugin, so the Kindle
+# keeps its node identity: bin/ if it takes chmod, else tmpfs seeded from bin/.
+# No `tailscale up`: the daemon resumes its saved up/down state by itself.
+# Userspace mode, as the plugin uses — we only need the proxy.
 # Left running on Stop: KOReader shares it, and it idles frozen while asleep.
 ensure_tailscale() {
   [ -n "$DASH_PROXY" ] || return 0
   pgrep tailscaled >/dev/null 2>&1 && return 0
-  if [ ! -x "$TS_BIN/tailscaled" ] || [ ! -x "$TS_BIN/tailscale" ] ||
-     [ ! -f "$TS_BIN/start_tailscale.sh" ]; then
+  if [ ! -x "$TS_BIN/tailscaled" ]; then
     echo "DASH_PROXY is set but no tailscaled in $TS_BIN; is the plugin installed?"
     return 0
   fi
@@ -97,10 +97,19 @@ ensure_tailscale() {
   # the proxy binds 127.0.0.1; some firmwares leave loopback down
   ifconfig lo 2>/dev/null | grep -q '127\.0\.0\.1' ||
     ifconfig lo 127.0.0.1 netmask 255.0.0.0 up 2>/dev/null
+  # KOReader's CA bundle beats the firmware's ancient one for the control plane
+  ca=/mnt/us/koreader/data/ca-bundle.crt
   echo "starting tailscaled from $TS_BIN (state in $statedir)"
-  TS_STATEDIR="$statedir" TS_DAEMON_ONLY=1 \
-    TS_TUN_FLAG=--tun=userspace-networking TS_NETWORK_MODE="userspace (kindle-dash)" \
-    sh "$TS_BIN/start_tailscale.sh" || echo "tailscaled start failed; see $TS_BIN/tailscaled.log"
+  (
+    cd "$TS_BIN" || exit 1
+    [ -r "$ca" ] && SSL_CERT_FILE="$ca" && export SSL_CERT_FILE
+    XDG_CACHE_HOME="$statedir" ./tailscaled --statedir="$statedir/" \
+      --tun=userspace-networking \
+      --socks5-server=127.0.0.1:1055 \
+      --outbound-http-proxy-listen=127.0.0.1:1056 \
+      >tailscaled.log 2>&1 &
+  )
+  sleep 5  # let the proxy come up so this cycle's fetch has a chance
 }
 
 fetch() {
