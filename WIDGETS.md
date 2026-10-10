@@ -56,7 +56,7 @@ Return shapes to match: weather `(condition, temp, feels)` · forecast `[(label,
 
 ## Shipped
 
-Clock · Weather (now) · Forecast (N-day) · Rain (HA hourly forecast, chance per hour) · Agenda (HA calendar) · Sun (HA sunrise/sunset) · Claude usage (5h/7d/Extra) · Codex usage (available windows/Credits) · opencode Go usage (5h/Week/Month).
+Clock · Weather (now) · Forecast (N-day) · Rain (HA hourly forecast, chance per hour) · Agenda (one or more HA calendars) · Sun (HA sunrise/sunset) · Claude usage (5h/7d/Extra) · Codex usage (available windows/Credits) · opencode Go usage (5h/Week/Month).
 
 The three usage providers (`usage`=Claude, `codex`, `opencode`) share one `_usage_block` renderer and split the bottom strip into a column each. Claude and Codex read OAuth usage APIs (refresh-token seeded); **opencode has no usage API, so its widget scrapes the Go dashboard HTML** with a browser cookie — see CONFIGURATION.md for the fragility caveat.
 

@@ -60,7 +60,10 @@ DASH_WIDGETS = [n for w in DASH_WIDGETS for n in (("sun", "rain") if w == "sunmo
 HA_BASE_URL = os.environ.get("HA_BASE_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 HA_WEATHER_ENTITY = os.environ.get("HA_WEATHER_ENTITY", "")
-HA_CALENDAR_ENTITY = os.environ.get("HA_CALENDAR_ENTITY", "")
+# Comma list: the agenda merges every calendar into one time-sorted list.
+HA_CALENDAR_ENTITIES = [
+    c.strip() for c in os.environ.get("HA_CALENDAR_ENTITY", "").split(",") if c.strip()
+]
 HA_SUN_ENTITY = os.environ.get("HA_SUN_ENTITY", "sun.sun")
 FORECAST_DAYS = int(os.environ.get("FORECAST_DAYS", "3"))
 RAIN_HOURS = int(os.environ.get("RAIN_HOURS", "12"))  # columns in the rain chart
@@ -219,31 +222,42 @@ def fetch_sun():
     return _local(a.get("next_rising")), _local(a.get("next_setting"))
 
 
-def fetch_events():
-    """List of (HH:MM-or-'all day', summary) for today, time-sorted, or None."""
-    if not HA_CALENDAR_ENTITY:
-        return None
-    now = datetime.now(TZINFO)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    data = _ha(
-        "GET",
-        f"/api/calendars/{HA_CALENDAR_ENTITY}",
-        start=start.isoformat(),
-        end=(start + timedelta(days=1)).isoformat(),
-    )
-    if data is None:  # fetch failed; [] is a real "nothing today"
-        return None
-    out = []
-    for ev in data:
+def parse_events(calendars, start):
+    """Merge HA calendar event lists into [(HH:MM-or-'all day', summary)].
+
+    Time-sorted, all-day events first. An event that is on more than one
+    calendar (e.g. a meeting invite) shows once. A timed event that began
+    before today (e.g. overnight) shows as '→HH:MM' (its end) with the all-day ones.
+    """
+    out = {}
+    for ev in (ev for data in calendars for ev in data):
         so = ev.get("start", {})
         summary = ev.get("summary", "(no title)")
         dt = _local(so.get("dateTime")) if "dateTime" in so else None
-        if dt:
-            out.append((dt, dt.strftime("%H:%M"), summary))
+        if dt and dt < start:
+            end = _local(ev.get("end", {}).get("dateTime"))
+            label = end.strftime("→%H:%M") if end and end < start + timedelta(days=1) else "all day"
+            out.setdefault((start, summary), label)
+        elif dt:
+            out.setdefault((dt, summary), dt.strftime("%H:%M"))
         else:
-            out.append((start, "all day", summary))
-    out.sort(key=lambda t: t[0])
-    return [(lbl, s) for _, lbl, s in out[:MAX_EVENTS]]
+            out.setdefault((start, summary), "all day")
+    rows = sorted(out.items(), key=lambda kv: (kv[0][0], kv[1] != "all day"))
+    return [(lbl, s) for (_, s), lbl in rows[:MAX_EVENTS]]
+
+
+def fetch_events():
+    """Today's events from every HA_CALENDAR_ENTITY (see parse_events), or None."""
+    if not HA_CALENDAR_ENTITIES:
+        return None
+    now = datetime.now(TZINFO)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    params = {"start": start.isoformat(), "end": (start + timedelta(days=1)).isoformat()}
+    calendars = [_ha("GET", f"/api/calendars/{c}", **params) for c in HA_CALENDAR_ENTITIES]
+    calendars = [data for data in calendars if data is not None]
+    if not calendars:  # every fetch failed; [] is a real "nothing today"
+        return None
+    return parse_events(calendars, start)
 
 
 # --- HA data cache: a background thread keeps render() free of network I/O --
