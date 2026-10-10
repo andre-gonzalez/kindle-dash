@@ -3,7 +3,7 @@ import json
 import pathlib
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from unittest import mock
 
@@ -99,6 +99,60 @@ class RenderContract(unittest.TestCase):
         # Bar starts at x=99 with a 3px outline. A non-zero value must fill
         # at least the first interior pixel instead of disappearing under it.
         self.assertEqual(image.getpixel((102, 70)), 0)
+
+    def test_hourly_forecast_parses_rain_probability(self):
+        resp = {"service_response": {"weather.home": {"forecast": [
+            {"datetime": "2026-07-19T18:00:00+00:00", "precipitation_probability": 40},
+            {"datetime": "2026-07-19T19:00:00+00:00", "precipitation_probability": 72.6},
+            {"datetime": "2026-07-19T20:00:00+00:00"},
+            {"precipitation_probability": 10},
+        ]}}}
+        result = app.parse_hourly(resp, "weather.home")
+        self.assertEqual([pct for _, pct in result], [40, 73, None])
+        self.assertEqual(result[0][0], NOW)
+        self.assertIsNone(app.parse_hourly(None, "weather.home"))
+        self.assertIsNone(app.parse_hourly(resp, "weather.other"))
+
+    def test_open_meteo_parses_rain_probability(self):
+        data = {"hourly": {
+            "time": [int(NOW.timestamp()), int(NOW.timestamp()) + 3600],
+            "precipitation_probability": [41, None],
+        }}
+        result = app.parse_open_meteo(data)
+        self.assertEqual([pct for _, pct in result], [41, None])
+        self.assertEqual(result[0][0], NOW)
+        self.assertIsNone(app.parse_open_meteo({}))
+
+    def test_hourly_falls_back_to_open_meteo_without_probability(self):
+        # Met.no-style hourly forecast: rain amount, no probability.
+        ha_hourly = {"service_response": {"weather.home": {"forecast": [
+            {"datetime": "2026-07-19T18:00:00+00:00", "precipitation": 0.4},
+        ]}}}
+        meteo = [(NOW, 55)]
+
+        def fake_ha(method, path, body=None, **params):
+            return ha_hourly if path.endswith("get_forecasts") else {"latitude": 1, "longitude": 2}
+
+        with (
+            mock.patch.object(app, "HA_WEATHER_ENTITY", "weather.home"),
+            mock.patch.object(app, "_ha", side_effect=fake_ha),
+            mock.patch.object(app, "requests") as req,
+            mock.patch.object(app, "parse_open_meteo", return_value=meteo),
+        ):
+            self.assertEqual(app.fetch_hourly(), meteo)
+        params = req.get.call_args.kwargs["params"]
+        self.assertEqual((params["latitude"], params["longitude"]), (1, 2))
+
+    def test_rain_chart_skips_past_hours(self):
+        now = datetime.now(app.TZINFO).replace(minute=0, second=0, microsecond=0)
+        past = [(now - timedelta(hours=2), 100), (now - timedelta(hours=1), 100)]
+        image = Image.new("L", (400, 120), 255)
+        draw = ImageDraw.Draw(image)
+        with mock.patch.dict(app.HA_DATA, {"hourly": past + [(now, 0)]}):
+            app.w_rain(draw, (0, 0, 400, 120))
+        # The first column is the current 0% hour, not a past 100% one: the
+        # inside of its bar stays white.
+        self.assertEqual(image.getpixel((16, 70)), 255)
 
     def test_empty_fixture_render_is_deterministic_png(self):
         widgets = app.DASH_WIDGETS

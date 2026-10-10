@@ -49,17 +49,27 @@ DASH_ROTATE = int(os.environ.get("DASH_ROTATE", "0"))
 DASH_DARK = os.environ.get("DASH_DARK", "0").lower() in ("1", "true", "yes", "on")
 DASH_WIDGETS = [
     w.strip()
-    for w in os.environ.get("DASH_WIDGETS", "clock,weather,forecast,agenda,sunmoon,usage").split(",")
+    for w in os.environ.get("DASH_WIDGETS", "clock,weather,forecast,agenda,sun,rain,usage").split(",")
     if w.strip()
 ]
+# The old "sunmoon" panel became "sun" (sunrise/sunset only) + "rain" (hourly
+# rain chance); expand the legacy name so existing configs keep working.
+DASH_WIDGETS = [n for w in DASH_WIDGETS for n in (("sun", "rain") if w == "sunmoon" else (w,))]
 
-# Home Assistant (optional) — powers weather, forecast, sun, and agenda widgets.
+# Home Assistant (optional) — powers weather, forecast, rain, sun, and agenda widgets.
 HA_BASE_URL = os.environ.get("HA_BASE_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
 HA_WEATHER_ENTITY = os.environ.get("HA_WEATHER_ENTITY", "")
 HA_CALENDAR_ENTITY = os.environ.get("HA_CALENDAR_ENTITY", "")
 HA_SUN_ENTITY = os.environ.get("HA_SUN_ENTITY", "sun.sun")
 FORECAST_DAYS = int(os.environ.get("FORECAST_DAYS", "3"))
+RAIN_HOURS = int(os.environ.get("RAIN_HOURS", "12"))  # columns in the rain chart
+# Rain chance falls back to Open-Meteo (free, no key) when the HA weather entity
+# has no hourly precipitation_probability (e.g. Met.no). The location defaults
+# to HA's home coordinates; RAIN_LAT/RAIN_LON override it.
+OPEN_METEO_URL = os.environ.get("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
+RAIN_LAT = os.environ.get("RAIN_LAT", "")
+RAIN_LON = os.environ.get("RAIN_LON", "")
 MAX_EVENTS = int(os.environ.get("DASH_MAX_EVENTS", "4"))
 DASH_POLL_MIN = int(os.environ.get("DASH_POLL_MIN", "5"))  # HA refresh cadence
 
@@ -177,6 +187,78 @@ def fetch_forecast():
     return out or None
 
 
+def parse_hourly(resp, entity):
+    """[(local_dt, rain_pct-or-None)] from a get_forecasts hourly response, or None."""
+    try:
+        hours = resp["service_response"][entity]["forecast"]
+    except Exception:
+        return None
+    out = []
+    for f in hours:
+        dt = _local(f.get("datetime"))
+        if dt is None:
+            continue
+        pct = f.get("precipitation_probability")
+        out.append((dt, round(pct) if isinstance(pct, (int, float)) else None))
+    return out or None
+
+
+def parse_open_meteo(data):
+    """[(local_dt, rain_pct-or-None)] from an Open-Meteo unixtime response, or None."""
+    try:
+        h = data["hourly"]
+        pairs = list(zip(h["time"], h["precipitation_probability"]))
+    except Exception:
+        return None
+    out = [
+        (datetime.fromtimestamp(t, TZINFO), round(p) if isinstance(p, (int, float)) else None)
+        for t, p in pairs
+    ]
+    return out or None
+
+
+def fetch_open_meteo():
+    """Hourly rain probability from Open-Meteo (see parse_open_meteo), or None."""
+    if RAIN_LAT and RAIN_LON:
+        lat, lon = RAIN_LAT, RAIN_LON
+    else:
+        cfg = _ha("GET", "/api/config") or {}
+        lat, lon = cfg.get("latitude"), cfg.get("longitude")
+    if lat is None or lon is None:
+        return None
+    try:
+        r = requests.get(
+            OPEN_METEO_URL,
+            params={
+                "latitude": lat, "longitude": lon,
+                "hourly": "precipitation_probability", "timeformat": "unixtime",
+                "forecast_days": 1 + -(-RAIN_HOURS // 24),  # today + enough to cover RAIN_HOURS
+            },
+            timeout=8,
+        )
+        r.raise_for_status()
+        return parse_open_meteo(r.json())
+    except Exception as e:
+        print(f"[open-meteo] fetch failed: {e}", flush=True)
+        return None
+
+
+def fetch_hourly():
+    """Hourly rain probability: the HA weather entity, else Open-Meteo. Or None."""
+    hours = None
+    if HA_WEATHER_ENTITY:
+        resp = _ha(
+            "POST",
+            "/api/services/weather/get_forecasts",
+            {"entity_id": HA_WEATHER_ENTITY, "type": "hourly"},
+            return_response="true",
+        )
+        hours = parse_hourly(resp, HA_WEATHER_ENTITY)
+    if hours and any(pct is not None for _, pct in hours):
+        return hours
+    return fetch_open_meteo() or hours
+
+
 def fetch_sun():
     """(sunrise_dt, sunset_dt) in local tz, or (None, None)."""
     data = _ha("GET", f"/api/states/{HA_SUN_ENTITY}") if HA_SUN_ENTITY else None
@@ -218,7 +300,10 @@ def fetch_events():
 # fetches there would block the response on serial network calls. Instead poll
 # them in the background and have the widgets read this snapshot (rebound
 # atomically, so a reader always sees one consistent dict).
-HA_DATA = {"weather": (None, None, None), "forecast": None, "sun": (None, None), "events": None}
+HA_DATA = {
+    "weather": (None, None, None), "forecast": None, "hourly": None,
+    "sun": (None, None), "events": None,
+}
 
 
 def ha_poll_loop():
@@ -227,23 +312,11 @@ def ha_poll_loop():
         HA_DATA = {
             "weather": fetch_weather(),
             "forecast": fetch_forecast(),
+            "hourly": fetch_hourly(),
             "sun": fetch_sun(),
             "events": fetch_events(),
         }
         time.sleep(DASH_POLL_MIN * 60)
-
-
-def moon_phase(now):
-    """Return (phase 0..1, illumination 0..1, name). Pure local synodic approx."""
-    ref = datetime(2000, 1, 6, 18, 14, tzinfo=timezone.utc)  # a known new moon
-    days = (now.astimezone(timezone.utc) - ref).total_seconds() / 86400.0
-    phase = (days % 29.53058867) / 29.53058867
-    illum = (1 - math.cos(2 * math.pi * phase)) / 2
-    names = [
-        "New", "Waxing crescent", "First quarter", "Waxing gibbous",
-        "Full", "Waning gibbous", "Last quarter", "Waning crescent",
-    ]
-    return phase, illum, names[int(phase * 8 + 0.5) % 8]
 
 
 # --- Claude usage: OAuth token refresh + usage fetch -----------------------
@@ -731,27 +804,43 @@ def w_agenda(d, box):
         yy += h * 0.17
 
 
-def w_sunmoon(d, box):
+def w_sun(d, box):
     x, y, w, h = box
     rise, sett = HA_DATA["sun"]
-    phase, illum, name = moon_phase(datetime.now(TZINFO))
-    f = _font(False, h * 0.13)
-    d.text((x, y), "SUN & MOON", font=_font(True, h * 0.13), fill=0)
-    yy = y + h * 0.2
-    d.text((x, yy), f"^ {rise.strftime('%H:%M')}" if rise else "^ --", font=f, fill=0)
-    d.text((x + w * 0.45, yy), f"v {sett.strftime('%H:%M')}" if sett else "v --", font=f, fill=0)
-    # moon glyph: disk + terminator showing the lit fraction
-    mr = h * 0.22
-    mcx, mcy = x + mr, y + h * 0.72
-    d.ellipse((mcx - mr, mcy - mr, mcx + mr, mcy + mr), outline=0, width=3)
-    if illum >= 0.98:
-        d.ellipse((mcx - mr, mcy - mr, mcx + mr, mcy + mr), fill=0)
-    elif illum > 0.02:
-        lit_right = phase < 0.5
-        d.chord((mcx - mr, mcy - mr, mcx + mr, mcy + mr), -90, 90 if lit_right else -90, fill=0)
-        k = abs(2 * illum - 1) * mr
-        d.ellipse((mcx - k, mcy - mr, mcx + k, mcy + mr), fill=0 if illum > 0.5 else 255)
-    d.text((mcx + mr + 12, mcy - h * 0.12), name, font=f, fill=0)
+    f = _font(False, h * 0.62)
+    d.text((x, y), "SUN", font=_font(True, h * 0.62), fill=0)
+    d.text((x + w * 0.14, y), f"^ {rise.strftime('%H:%M')}" if rise else "^ --", font=f, fill=0)
+    d.text((x + w * 0.36, y), f"v {sett.strftime('%H:%M')}" if sett else "v --", font=f, fill=0)
+
+
+def w_rain(d, box):
+    """Hour-by-hour rain probability: one bar per hour, % above, hour below."""
+    x, y, w, h = box
+    d.text((x, y), "RAIN CHANCE", font=_font(True, h * 0.14), fill=0)
+    f = _font(False, h * 0.14)
+    now = datetime.now(TZINFO).replace(minute=0, second=0, microsecond=0)
+    hours = [(dt, pct) for dt, pct in HA_DATA["hourly"] or [] if dt >= now][:RAIN_HOURS]
+    if not hours:
+        d.text((x, y + h * 0.25), "rain n/a", font=f, fill=0)
+        return
+    # Fixed pitch (not w/len(hours)) so bars keep their width when HA returns
+    # fewer hours than RAIN_HOURS.
+    cw = w / RAIN_HOURS
+    bw = cw * 0.6
+    top, base = y + h * 0.40, y + h * 0.80
+    # Shrink the value font until the widest label ("100%") fits its column.
+    vf = f
+    while vf.size > 8 and d.textlength("100%", font=vf) > cw * 0.92:
+        vf = _font(False, vf.size - 1)
+    for i, (dt, pct) in enumerate(hours):
+        cx = x + cw * (i + 0.5)
+        d.rectangle((cx - bw / 2, top, cx + bw / 2, base), outline=0, width=1)  # 100% track
+        if pct:
+            d.rectangle((cx - bw / 2, base - (base - top) * min(pct, 100) / 100, cx + bw / 2, base), fill=0)
+        label = "—" if pct is None else f"{pct}%"
+        d.text((cx, y + h * 0.22), label, font=vf, fill=0, anchor="ma")
+        d.text((cx, base + h * 0.05), dt.strftime("%H"), font=f, fill=0, anchor="ma")
+    d.line((x, base, x + cw * len(hours), base), fill=0, width=2)
 
 
 def _rows(usage, keys):
@@ -788,7 +877,7 @@ def w_opencode(d, box):
 
 WIDGET_FNS = {
     "clock": w_clock, "weather": w_weather, "agenda": w_agenda,
-    "forecast": w_forecast, "sunmoon": w_sunmoon,
+    "forecast": w_forecast, "sun": w_sun, "rain": w_rain,
     "usage": w_usage, "codex": w_codex, "opencode": w_opencode,
 }
 # Providers that share the bottom usage strip (split into columns, in order).
@@ -820,8 +909,9 @@ def render(rotate=None):
         "clock": (pad, pad, mid - pad, hdr_h),
         "weather": (mid, pad, rcol, hdr_h),
         "agenda": (pad, mid_y, mid - 2 * pad, midrow),
-        "forecast": (mid, mid_y, rcol, midrow * 0.45),
-        "sunmoon": (mid, mid_y + midrow * 0.5, rcol, midrow * 0.5),
+        "forecast": (mid, mid_y, rcol, midrow * 0.42),
+        "sun": (mid, mid_y + midrow * 0.46, rcol, midrow * 0.1),
+        "rain": (mid, mid_y + midrow * 0.6, rcol, midrow * 0.4),
     }
     # The bottom strip is the usage zone: split it into equal columns, one per
     # enabled usage provider (Claude / Codex / opencode), in DASH_WIDGETS order.
@@ -890,7 +980,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"kindle-dash on :8080  ({KINDLE_W}x{KINDLE_H}, tz={TZ})", flush=True)
-    if HA_BASE_URL:
+    if HA_BASE_URL or (RAIN_LAT and RAIN_LON):
         threading.Thread(target=ha_poll_loop, daemon=True).start()
     if CLAUDE_REFRESH_TOKEN or os.path.exists(TOKEN_FILE):
         threading.Thread(target=usage_poll_loop, daemon=True).start()

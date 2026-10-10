@@ -10,13 +10,13 @@ All renderer config is environment variables (in `renderer/.env`; see `.env.exam
 | `TZ` | `UTC` | IANA tz, e.g. `America/Sao_Paulo`. Drives the clock + all formatted times. |
 | `DASH_ROTATE` | `0` | `0/90/180/270`. Rotates the frame **server-side** — `90` fills a portrait panel mounted sideways (`270` if upside down). |
 | `DASH_DARK` | `0` | `1` = light-on-black (e-ink dark mode; the whole frame is inverted). |
-| `DASH_WIDGETS` | all | Comma list of panels to draw, in order: `clock,weather,forecast,agenda,sunmoon,usage`. Drop any to hide it. The usage providers (`usage`=Claude, `codex`, `opencode`) share the bottom strip and split it into one column each. |
+| `DASH_WIDGETS` | all | Comma list of panels to draw, in order: `clock,weather,forecast,agenda,sun,rain,usage`. Drop any to hide it. The legacy name `sunmoon` still works and expands to `sun,rain`. The usage providers (`usage`=Claude, `codex`, `opencode`) share the bottom strip and split it into one column each. |
 | `PORT` | `8810` | Host port the container publishes (compose). |
 | `DASH_FONT_DIR` | `/usr/share/fonts/truetype/dejavu` | Where the DejaVu TTFs live (the image ships them). |
 
 > **All visual options live here, not on the device.** Rotation, dark mode, and the widget set are container env — the Kindle only ever opens the bare `GET /dash.png`. Change a knob, recreate the container, done; nothing to touch on the Kindle.
 
-## Home Assistant (weather · forecast · sun · agenda)
+## Home Assistant (weather · forecast · rain · sun · agenda)
 
 Optional. Create a long-lived token: HA → Profile → Security → Long-lived access tokens.
 
@@ -24,13 +24,15 @@ Optional. Create a long-lived token: HA → Profile → Security → Long-lived 
 |---|---|---|
 | `HA_BASE_URL` | `http://192.168.1.5:8123` | all HA panels (blank = all off) |
 | `HA_TOKEN` | `eyJ…` | auth |
-| `HA_WEATHER_ENTITY` | `weather.home` | weather **and** the forecast strip |
+| `HA_WEATHER_ENTITY` | `weather.home` | weather, the forecast strip, **and** the rain chart |
 | `HA_CALENDAR_ENTITY` | `calendar.personal` | agenda (blank = hidden) |
-| `HA_SUN_ENTITY` | `sun.sun` | sunrise/sunset (moon phase is computed locally, no entity needed) |
+| `HA_SUN_ENTITY` | `sun.sun` | sunrise/sunset |
 | `FORECAST_DAYS` | `3` | days in the forecast strip |
+| `RAIN_HOURS` | `12` | hours in the rain chart (from the current hour) |
+| `RAIN_LAT` / `RAIN_LON` | HA home location | location for the Open-Meteo rain fallback (below) |
 | `DASH_MAX_EVENTS` | `4` | agenda rows |
 
-Forecast uses HA's `weather.get_forecasts` service; if your weather integration doesn't support daily forecasts, the strip just hides.
+Forecast uses HA's `weather.get_forecasts` service; if your weather integration doesn't support daily forecasts, the strip just hides. The rain chart uses the same service with `type: hourly` and reads `precipitation_probability`. Some integrations (e.g. the default Met.no) give only the rain amount, not the probability; then the chart gets the probability from [Open-Meteo](https://open-meteo.com) instead (free, no API key), at HA's home location or `RAIN_LAT`/`RAIN_LON`. This is the only call that leaves your network for weather. If neither source answers it shows `rain n/a`, and an hour with no probability shows `—`.
 
 ## Claude usage (5h / 7d / Extra)
 
