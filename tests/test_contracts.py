@@ -120,8 +120,9 @@ class RenderContract(unittest.TestCase):
         draw = ImageDraw.Draw(image)
         with mock.patch.dict(app.HA_DATA, {"hourly": past + [(now, 0)]}):
             app.w_rain(draw, (0, 0, 400, 120))
-        # Only the 0% hour is drawn: its bar track stays light, never filled.
-        self.assertNotIn(0, image.crop((0, 50, 400, 94)).getdata())
+        # The first column is the current 0% hour, not a past 100% one: the
+        # inside of its bar stays white.
+        self.assertEqual(image.getpixel((16, 70)), 255)
 
     def test_empty_fixture_render_is_deterministic_png(self):
         widgets = app.DASH_WIDGETS
