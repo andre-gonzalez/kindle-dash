@@ -31,6 +31,7 @@ Optional. Create a long-lived token: HA → Profile → Security → Long-lived 
 | `RAIN_HOURS` | `12` | hours in the rain chart (from the current hour) |
 | `RAIN_LAT` / `RAIN_LON` | HA home location | location for the Open-Meteo rain fallback (below) |
 | `DASH_MAX_EVENTS` | `4` | agenda rows |
+| `DASH_EVENT_GRACE_MIN` | `15` | minutes after its start that a timed event stays on the agenda (an 08:00 event shows until 08:15). An overnight event (`→HH:MM`) hides this long after its end. All-day events stay all day. |
 
 Forecast uses HA's `weather.get_forecasts` service; if your weather integration doesn't support daily forecasts, the strip just hides. The rain chart uses the same service with `type: hourly` and reads `precipitation_probability`. Some integrations (e.g. the default Met.no) give only the rain amount, not the probability; then the chart gets the probability from [Open-Meteo](https://open-meteo.com) instead (free, no API key), at HA's home location or `RAIN_LAT`/`RAIN_LON`. This is the only call that leaves your network for weather. If neither source answers it shows `rain n/a`, and an hour with no probability shows `—`.
 

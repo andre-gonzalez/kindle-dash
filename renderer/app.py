@@ -74,6 +74,7 @@ OPEN_METEO_URL = os.environ.get("OPEN_METEO_URL", "https://api.open-meteo.com/v1
 RAIN_LAT = os.environ.get("RAIN_LAT", "")
 RAIN_LON = os.environ.get("RAIN_LON", "")
 MAX_EVENTS = int(os.environ.get("DASH_MAX_EVENTS", "4"))
+EVENT_GRACE_MIN = int(os.environ.get("DASH_EVENT_GRACE_MIN", "15"))  # past-event hide delay
 DASH_POLL_MIN = int(os.environ.get("DASH_POLL_MIN", "5"))  # HA refresh cadence
 
 # Claude usage (optional) — fetched from the OAuth usage API; the short-lived
@@ -272,12 +273,14 @@ def fetch_sun():
 
 
 def parse_events(calendars, start):
-    """Merge HA calendar event lists into [(HH:MM-or-'all day', summary)].
+    """Merge HA calendar event lists into [(shown_dt, HH:MM-or-'all day', summary)].
 
     Time-sorted, all-day events first. An event that is on more than one
     calendar (e.g. a meeting invite) shows once. A timed event that began
     before today (e.g. overnight) shows as '→HH:MM' (its end) with the all-day ones.
     An event with no title (e.g. from a free/busy-only share) shows as 'busy'.
+    shown_dt is the time the label shows (None for 'all day'); visible_events()
+    uses it to hide events that have passed.
     """
     out = {}
     for ev in (ev for data in calendars for ev in data):
@@ -286,14 +289,28 @@ def parse_events(calendars, start):
         dt = _local(so.get("dateTime")) if "dateTime" in so else None
         if dt and dt < start:
             end = _local(ev.get("end", {}).get("dateTime"))
-            label = end.strftime("→%H:%M") if end and end < start + timedelta(days=1) else "all day"
-            out.setdefault((start, summary), label)
+            if end and end < start + timedelta(days=1):
+                out.setdefault((start, summary), (end, end.strftime("→%H:%M")))
+            else:
+                out.setdefault((start, summary), (None, "all day"))
         elif dt:
-            out.setdefault((dt, summary), dt.strftime("%H:%M"))
+            out.setdefault((dt, summary), (dt, dt.strftime("%H:%M")))
         else:
-            out.setdefault((start, summary), "all day")
-    rows = sorted(out.items(), key=lambda kv: (kv[0][0], kv[1] != "all day"))
-    return [(lbl, s) for (_, s), lbl in rows[:MAX_EVENTS]]
+            out.setdefault((start, summary), (None, "all day"))
+    rows = sorted(out.items(), key=lambda kv: (kv[0][0], kv[1][1] != "all day"))
+    return [(at, lbl, s) for (_, s), (at, lbl) in rows]
+
+
+def visible_events(events, now):
+    """The first MAX_EVENTS agenda rows as [(label, summary)].
+
+    A timed event hides EVENT_GRACE_MIN after its shown time (an 08:00 event
+    shows until 08:15). This runs at render time, not in the HA poll, so an
+    event hides on time even between polls.
+    """
+    grace = timedelta(minutes=EVENT_GRACE_MIN)
+    rows = [(lbl, s) for at, lbl, s in events if at is None or now <= at + grace]
+    return rows[:MAX_EVENTS]
 
 
 def fetch_events():
@@ -797,6 +814,7 @@ def w_agenda(d, box):
     if events is None:
         d.text((x, yy), "no calendar", font=f, fill=0)
         return
+    events = visible_events(events, datetime.now(TZINFO))
     if not events:
         d.text((x, yy), "nothing scheduled", font=f, fill=0)
         return

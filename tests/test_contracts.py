@@ -127,15 +127,52 @@ class RenderContract(unittest.TestCase):
             # The same invite on both calendars shows once.
             {"start": at(15), "summary": "Gym"},
         ]
-        with mock.patch.object(app, "MAX_EVENTS", 10):
-            result = app.parse_events([personal, work], start)
-        self.assertEqual(result, [
+        result = app.parse_events([personal, work], start)
+        self.assertEqual([(lbl, s) for _, lbl, s in result], [
             ("all day", "Birthday"),
             ("→05:30", "Sleep"),
             ("09:30", "Standup"),
             ("11:00", "busy"),
             ("15:00", "Gym"),
         ])
+        self.assertEqual([at for at, _, _ in result], [
+            None,
+            start + timedelta(hours=5.5),
+            start + timedelta(hours=9.5),
+            start + timedelta(hours=11),
+            start + timedelta(hours=15),
+        ])
+
+    def test_agenda_hides_events_past_the_grace_period(self):
+        start = datetime(2026, 7, 19, tzinfo=app.TZINFO)
+
+        def at(hours):
+            return start + timedelta(hours=hours)
+
+        events = [
+            (None, "all day", "Birthday"),
+            (at(5.5), "→05:30", "Sleep"),
+            (at(8), "08:00", "Standup"),
+            (at(9), "09:00", "Review"),
+            (at(10), "10:00", "Lunch"),
+        ]
+        with mock.patch.object(app, "MAX_EVENTS", 10), mock.patch.object(app, "EVENT_GRACE_MIN", 15):
+            # An 08:00 event still shows at 08:15 ...
+            self.assertEqual(
+                [s for _, s in app.visible_events(events, at(8.25))],
+                ["Birthday", "Standup", "Review", "Lunch"],
+            )
+            # ... and is gone one minute later. All-day events stay.
+            self.assertEqual(
+                [s for _, s in app.visible_events(events, at(8.25) + timedelta(minutes=1))],
+                ["Birthday", "Review", "Lunch"],
+            )
+        # The row cap applies after past events are dropped.
+        with mock.patch.object(app, "MAX_EVENTS", 2):
+            self.assertEqual(
+                app.visible_events(events, at(9)),
+                [("all day", "Birthday"), ("09:00", "Review")],
+            )
 
     def test_agenda_keeps_calendars_that_fetched(self):
         work = [{"start": {"date": "2026-07-19"}, "summary": "Offsite"}]
@@ -143,7 +180,7 @@ class RenderContract(unittest.TestCase):
             mock.patch.object(app, "HA_CALENDAR_ENTITIES", ["calendar.a", "calendar.b"]),
             mock.patch.object(app, "_ha", side_effect=[None, work]),
         ):
-            self.assertEqual(app.fetch_events(), [("all day", "Offsite")])
+            self.assertEqual(app.fetch_events(), [(None, "all day", "Offsite")])
         with (
             mock.patch.object(app, "HA_CALENDAR_ENTITIES", ["calendar.a", "calendar.b"]),
             mock.patch.object(app, "_ha", return_value=None),
