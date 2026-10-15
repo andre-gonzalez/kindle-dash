@@ -10,7 +10,7 @@ All renderer config is environment variables (in `renderer/.env`; see `.env.exam
 | `TZ` | `UTC` | IANA tz, e.g. `America/Sao_Paulo`. Drives the clock + all formatted times. |
 | `DASH_ROTATE` | `0` | `0/90/180/270`. Rotates the frame **server-side** — `90` fills a portrait panel mounted sideways (`270` if upside down). |
 | `DASH_DARK` | `0` | `1` = light-on-black (e-ink dark mode; the whole frame is inverted). |
-| `DASH_WIDGETS` | all | Comma list of panels to draw, in order: `clock,weather,forecast,agenda,sun,rain,usage`. Drop any to hide it. The legacy name `sunmoon` still works and expands to `sun,rain`. The usage providers (`usage`=Claude, `codex`, `opencode`) share the bottom strip and split it into one column each. |
+| `DASH_WIDGETS` | all | Comma list of panels to draw, in order: `clock,weather,forecast,agenda,sun,rain,usage`. Drop any to hide it. The legacy name `sunmoon` still works and expands to `sun,rain`. The usage providers (`usage`=Claude, `codex`, `opencode`, `openrouter`) share the bottom strip and split it into one column each. |
 | `PORT` | `8810` | Host port the container publishes (compose). |
 | `DASH_FONT_DIR` | `/usr/share/fonts/truetype/dejavu` | Where the DejaVu TTFs live (the image ships them). |
 
@@ -85,6 +85,25 @@ Optional, and **fragile**: opencode has no usage API (tracked upstream — [Go #
 | `OPENCODE_GO_URL` | `https://opencode.ai/workspace/{ws}/go` | dashboard URL template (`{ws}` = workspace id) |
 
 Parses the `rollingUsage` / `weeklyUsage` / `monthlyUsage` objects (`usagePercent` + `resetInSec`) embedded in the page. If opencode changes the dashboard markup this breaks — the panel then renders `(stale)`/`usage n/a`, never a broken frame.
+
+## OpenRouter monthly spend (Month USD)
+
+Optional. Shows how many USD you spent on OpenRouter this month, across **all** API keys. Add `openrouter` to `DASH_WIDGETS`.
+
+| Var | Default | Notes |
+|---|---|---|
+| `OPENROUTER_MANAGEMENT_KEY` | — | a **management** key (openrouter.ai/settings/management-keys). A normal API key can't list keys. Blank = panel off. |
+| `OPENROUTER_MONTH_BUDGET` | — | monthly budget in USD. The bar shows spend / budget and stops at 100%; the text always shows the real spend (`$34.10 / $30`). Blank = USD text only, empty bar. |
+| `OPENROUTER_POLL_MIN` | `15` | minutes between usage refreshes |
+| `OPENROUTER_KEYS_URL` | `https://openrouter.ai/api/v1/keys` | key list endpoint |
+
+Lists every key (disabled and expired included) and adds up `usage_monthly` — OpenRouter credit spend for the current **UTC** month, so the reset shows as 00:00 UTC on the 1st in your `TZ`. Limits:
+
+- **Deleted keys** drop out of the list, so their spend this month drops out of the total.
+- **Default workspace only** — keys in other workspaces aren't counted.
+- **BYOK** spend (paid to your own provider account) isn't counted; the total matches your OpenRouter credits.
+
+`CLAUDE_STALE_AFTER_MIN` also drives this panel's `(stale)` marker.
 
 ## Device (`dashboard.sh`)
 

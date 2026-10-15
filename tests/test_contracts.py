@@ -58,6 +58,52 @@ class ParserContract(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no usage windows found"):
             app.parse_opencode_usage("<html>changed dashboard</html>", now=NOW)
 
+    def test_openrouter_fixture_sums_month_across_keys(self):
+        keys = self.fixture_json("openrouter-keys.json")["data"]
+        with mock.patch.object(app, "TZINFO", timezone.utc):
+            result = app.parse_openrouter_usage(keys, now=NOW)
+        # Disabled keys count; BYOK spend does not.
+        self.assertEqual(result["month_usd"], 12.4)
+        self.assertEqual(result["keys"], 2)
+        self.assertEqual(result["month_reset"], "Aug 01, 00:00")
+        self.assertEqual(result["updated"], NOW.isoformat())
+
+    def test_openrouter_december_resets_in_january(self):
+        with mock.patch.object(app, "TZINFO", timezone.utc):
+            result = app.parse_openrouter_usage(
+                [], now=datetime(2026, 12, 31, 23, 0, tzinfo=timezone.utc)
+            )
+        self.assertEqual(result["month_usd"], 0)
+        self.assertEqual(result["month_reset"], "Jan 01, 00:00")
+
+    def test_openrouter_fetch_pages_until_no_new_keys(self):
+        keys = self.fixture_json("openrouter-keys.json")["data"]
+        pages = [{"data": keys[:1]}, {"data": keys[1:]}, {"data": []}]
+        with mock.patch.object(app, "requests") as req:
+            req.get.return_value.json.side_effect = pages
+            result = app.fetch_openrouter_once()
+        self.assertEqual(result["month_usd"], 12.4)
+        offsets = [c.kwargs["params"]["offset"] for c in req.get.call_args_list]
+        self.assertEqual(offsets, [0, 1, 2])
+        params = req.get.call_args.kwargs["params"]
+        self.assertEqual(
+            (params["include_disabled"], params["include_expired"]), ("true", "true")
+        )
+
+    def test_openrouter_fetch_stops_when_offset_is_ignored(self):
+        keys = self.fixture_json("openrouter-keys.json")["data"]
+        with mock.patch.object(app, "requests") as req:
+            req.get.return_value.json.return_value = {"data": keys}
+            result = app.fetch_openrouter_once()
+        self.assertEqual(result["keys"], 2)
+        self.assertEqual(req.get.call_count, 2)
+
+    def test_openrouter_unexpected_response_fails_closed(self):
+        with mock.patch.object(app, "requests") as req:
+            req.get.return_value.json.return_value = {"error": {"code": 403}}
+            with self.assertRaisesRegex(RuntimeError, "no key list"):
+                app.fetch_openrouter_once()
+
 
 class RenderContract(unittest.TestCase):
     def test_claude_rows_omit_extra_spend(self):
@@ -81,6 +127,39 @@ class RenderContract(unittest.TestCase):
                 ("7d", 4, "Jul 25, 08:00"),
             ],
         )
+
+    def openrouter_rows(self, budget):
+        usage = {"month_usd": 12.4, "month_reset": "Aug 01, 00:00"}
+        with (
+            mock.patch.object(app, "read_usage", return_value=(usage, False)),
+            mock.patch.object(app, "OPENROUTER_MONTH_BUDGET", budget),
+            mock.patch.object(app, "_usage_block") as block,
+        ):
+            app.w_openrouter(mock.Mock(), (0, 0, 300, 300))
+        return block.call_args.args[3]
+
+    def test_openrouter_row_fills_bar_against_budget(self):
+        self.assertEqual(
+            self.openrouter_rows(30.0),
+            [("Month", None, "$12.40 / $30  ·  Aug 01, 00:00", 41)],
+        )
+
+    def test_openrouter_row_without_budget_has_no_fill(self):
+        self.assertEqual(
+            self.openrouter_rows(None),
+            [("Month", None, "$12.40  ·  Aug 01, 00:00", None)],
+        )
+
+    def test_bar_fill_override_fills_bar_without_percent_text(self):
+        image = Image.new("L", (300, 300), 255)
+        draw = ImageDraw.Draw(image)
+
+        with mock.patch.object(app, "_font", return_value=ImageFont.load_default()):
+            app._usage_block(
+                draw, (0, 0, 300, 300), "OpenRouter", [("Month", None, "$12.40", 50)], False
+            )
+
+        self.assertEqual(image.getpixel((102, 70)), 0)
 
     def test_one_percent_usage_has_visible_fill_inside_outline(self):
         image = Image.new("L", (300, 300), 255)

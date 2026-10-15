@@ -1,0 +1,36 @@
+{
+  "data": [
+    {
+      "hash": "a1b2c3",
+      "name": "laptop",
+      "label": "sk-or-v1-abc...123",
+      "disabled": false,
+      "limit": null,
+      "limit_remaining": null,
+      "usage": 41.2,
+      "usage_daily": 0.85,
+      "usage_weekly": 4.1,
+      "usage_monthly": 9.15,
+      "byok_usage": 3.0,
+      "byok_usage_monthly": 3.0,
+      "created_at": "2026-05-02T10:00:00Z",
+      "updated_at": "2026-07-19T17:00:00Z"
+    },
+    {
+      "hash": "d4e5f6",
+      "name": "old-agent",
+      "label": "sk-or-v1-def...456",
+      "disabled": true,
+      "limit": 20,
+      "limit_remaining": 16.75,
+      "usage": 3.25,
+      "usage_daily": 0,
+      "usage_weekly": 0,
+      "usage_monthly": 3.25,
+      "byok_usage": 0,
+      "byok_usage_monthly": 0,
+      "created_at": "2026-07-01T09:00:00Z",
+      "updated_at": "2026-07-03T12:00:00Z"
+    }
+  ]
+}
