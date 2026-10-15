@@ -1,39 +1,117 @@
 name: publish-fork
 
-# Fork releases. Push a `fork-v<semver>` tag (e.g. fork-v0.10.0) to build the
-# renderer and publish ghcr.io/<owner>/kindle-dash:<semver>, which servarr pins.
-# The `fork-` prefix keeps these tags apart from the upstream v* tags.
-# publish.yml stays upstream-only: it pushes to ErikBPF's registry and repos.
+# Fork releases: ghcr.io/<owner>/kindle-dash:<semver>, which servarr pins and
+# Renovate bumps. The `fork-` prefix keeps these tags apart from the upstream
+# v* tags. publish.yml stays upstream-only: it pushes to ErikBPF's registry.
+#
+# Automatic: when CI passes on a push to main, the release job looks at the
+# commits since the last fork-v* tag that touch renderer/ (the image's build
+# context). None: no release, the image would not change. Otherwise it bumps
+# from their Conventional Commit subjects (`type!:` or `BREAKING CHANGE:` ->
+# major, `feat` -> minor, anything else -> patch), pushes the fork-v<semver>
+# tag and publishes the image.
+#
+# Manual: push a `fork-v<semver>` tag (e.g. fork-v0.10.0) yourself. A tag the
+# release job pushes does not start this workflow again: pushes made with
+# GITHUB_TOKEN never trigger workflows, so the image is built once.
 on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   push:
     tags: ["fork-v*"]
 
-permissions:
-  contents: read
-  packages: write
+permissions: {}
 
 concurrency:
   group: publish-fork
   cancel-in-progress: false
 
 jobs:
-  publish:
-    if: github.repository != 'ErikBPF/kindle-dash'
+  release:
+    if: >-
+      github.repository != 'ErikBPF/kindle-dash' &&
+      (github.event_name == 'push' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_repository.full_name == github.repository))
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'workflow_run'
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            version="${GITHUB_REF_NAME#fork-v}"
+            if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::tag $GITHUB_REF_NAME is not fork-v<major>.<minor>.<patch>"
+              exit 1
+            fi
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # A newer run already released this commit (CI runs can finish out
+          # of order).
+          if [[ -n "$(git tag --list 'fork-v*' --contains HEAD)" ]]; then
+            echo "::notice::HEAD is already in a fork-v* release"
+            exit 0
+          fi
+          last=$(git describe --tags --abbrev=0 --match 'fork-v[0-9]*' HEAD)
+          commits=$(git log --no-merges --format='%s%n%b' "$last..HEAD" -- renderer/)
+          if [[ -z "$commits" ]]; then
+            echo "::notice::nothing under renderer/ changed since $last"
+            exit 0
+          fi
+
+          IFS=. read -r major minor patch <<< "${last#fork-v}"
+          if grep -qE '^[a-z]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:' <<< "$commits"; then
+            version="$((major + 1)).0.0"
+          elif grep -qE '^feat(\([^)]*\))?:' <<< "$commits"; then
+            version="$major.$((minor + 1)).0"
+          else
+            version="$major.$minor.$((patch + 1))"
+          fi
+
+          git tag "fork-v$version" HEAD
+          git push origin "refs/tags/fork-v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "### Tagged fork-v$version (was $last)" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: release
+    if: needs.release.outputs.version != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.release.outputs.sha }}
 
       - name: Image name and version
         id: meta
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
         run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#fork-v}"
-          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::tag $GITHUB_REF_NAME is not fork-v<major>.<minor>.<patch>"
-            exit 1
-          fi
           echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kindle-dash" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-buildx-action@594f3bf4285d9ea8dc53c9a0c9c4092420091003 # v4.4.0
 
@@ -54,7 +132,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.image }}:${{ steps.meta.outputs.version }}
           labels: |
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ needs.release.outputs.sha }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.meta.outputs.version }}
 
