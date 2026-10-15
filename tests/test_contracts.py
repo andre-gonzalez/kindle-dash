@@ -30,8 +30,6 @@ class ParserContract(unittest.TestCase):
         )
         self.assertEqual(result["session_pct"], 42)
         self.assertEqual(result["week_pct"], 63)
-        self.assertEqual(result["fable_pct"], 27)
-        self.assertEqual(result["fable_reset"], "Jul 24, 22:00")
         self.assertEqual(result["extra_pct"], 12)
         self.assertEqual(result["updated"], NOW.isoformat())
 
@@ -62,14 +60,12 @@ class ParserContract(unittest.TestCase):
 
 
 class RenderContract(unittest.TestCase):
-    def test_claude_third_row_is_fable_limit_not_extra_spend(self):
+    def test_claude_rows_omit_extra_spend(self):
         usage = {
             "session_pct": 3,
             "session_reset": "",
             "week_pct": 4,
             "week_reset": "Jul 25, 08:00",
-            "fable_pct": 5,
-            "fable_reset": "Jul 26, 08:00",
             "extra_enabled": True,
             "extra_pct": 99,
         }
@@ -83,7 +79,6 @@ class RenderContract(unittest.TestCase):
             [
                 ("5h", 3, ""),
                 ("7d", 4, "Jul 25, 08:00"),
-                ("Fable", 5, "Jul 26, 08:00"),
             ],
         )
 

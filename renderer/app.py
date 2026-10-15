@@ -408,16 +408,6 @@ def parse_claude_usage(data, now=None):
 
     s, w = data.get("five_hour") or {}, data.get("seven_day") or {}
     extra = data.get("extra_usage") or {}
-    fable = next(
-        (
-            limit
-            for limit in data.get("limits") or []
-            if limit.get("kind") == "weekly_scoped"
-            and ((limit.get("scope") or {}).get("model") or {}).get("display_name")
-            == "Fable"
-        ),
-        {},
-    )
 
     def pct(value):
         return round(value["utilization"]) if value.get("utilization") is not None else None
@@ -425,8 +415,6 @@ def parse_claude_usage(data, now=None):
     return {
         "session_pct": pct(s), "session_reset": fmt(s.get("resets_at")),
         "week_pct": pct(w), "week_reset": fmt(w.get("resets_at")),
-        "fable_pct": round(fable["percent"]) if fable.get("percent") is not None else None,
-        "fable_reset": fmt(fable.get("resets_at")),
         "extra_enabled": bool(extra.get("is_enabled")),
         "extra_pct": pct(extra),
         "extra_used": extra.get("used_credits"),
@@ -866,8 +854,6 @@ def _rows(usage, keys):
 def w_usage(d, box):
     usage, stale = read_usage()
     rows = _rows(usage, [("5h", "session"), ("7d", "week")]) if usage else []
-    if usage:
-        rows.append(("Fable", usage.get("fable_pct"), usage.get("fable_reset", "")))
     _usage_block(d, box, "Claude", rows, stale)
 
 
@@ -897,8 +883,8 @@ WIDGET_FNS = {
 }
 # Providers that share the bottom usage strip (split into columns, in order).
 USAGE_NAMES = ("usage", "codex", "opencode")
-# Row slots reserved per usage column = the most any provider shows (Claude /
-# opencode = 3). Fixing this gives every column the same row pitch so bars align.
+# Row slots reserved per usage column = the most any provider shows (opencode =
+# 3). Fixing this gives every column the same row pitch so bars align.
 USAGE_ROWS = 3
 
 
