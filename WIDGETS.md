@@ -52,7 +52,7 @@ Good HA-free candidates:
 - **Weather + forecast + sun → [Open-Meteo](https://open-meteo.com)** — free, keyless; one GET returns current, daily hi/lo, and sunrise/sunset. Covers three widgets with just a lat/lon.
 - **Agenda → an `.ics` URL** — Google/Outlook/Apple all publish one. Recurring events need an ICS library (`icalendar` + recurrence expansion).
 
-Return shapes to match: weather `(condition, temp, feels)` · forecast `[(label, condition, hi, lo), …]` · sun `(sunrise_dt, sunset_dt)` · agenda `[(time_label, summary), …]`. Return `None` on any failure.
+Return shapes to match: weather `(condition, temp, feels)` · forecast `[(label, condition, hi, lo), …]` · sun `(sunrise_dt, sunset_dt)` · agenda `[(shown_dt_or_None, time_label, summary), …]` (all of today's events; `w_agenda` hides the past ones and caps the rows). Return `None` on any failure.
 
 ## Shipped
 
