@@ -42,6 +42,16 @@ opencode exposes **no usage API** ([upstream request #16017](https://github.com/
 
 Set `OPENCODE_WORKSPACE_ID` + `OPENCODE_AUTH_COOKIE` (both opt-in; blank = panel off).
 
+## OpenRouter — the panel needs a management key
+
+The OpenRouter panel uses the documented `GET https://openrouter.ai/api/v1/keys` endpoint, which only accepts a **management key**. A management key is far more powerful than the usage needs: it can **create, change, and delete API keys** and read every key's usage. The renderer only reads, but anyone who gets the key can do the rest.
+
+- Make a management key just for the dashboard, so you can revoke it alone.
+- Keep it in `renderer/.env` (or your secret store) only — never in git or on the Kindle.
+- If it leaks, delete it in openrouter.ai/settings/management-keys.
+
+Opt-in: leave `OPENROUTER_MANAGEMENT_KEY` blank and none of it runs.
+
 ## Token handling
 
 - The refresh token is a credential. Keep `renderer/.env` out of git (it's in `.gitignore`) and off shared storage; use your platform's secret mechanism if you have one.
