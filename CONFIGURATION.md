@@ -10,7 +10,7 @@ All renderer config is environment variables (in `renderer/.env`; see `.env.exam
 | `TZ` | `UTC` | IANA tz, e.g. `America/Sao_Paulo`. Drives the clock + all formatted times. |
 | `DASH_ROTATE` | `0` | `0/90/180/270`. Rotates the frame **server-side** — `90` fills a portrait panel mounted sideways (`270` if upside down). |
 | `DASH_DARK` | `0` | `1` = light-on-black (e-ink dark mode; the whole frame is inverted). |
-| `DASH_WIDGETS` | all | Comma list of panels to draw, in order: `clock,weather,forecast,agenda,sun,rain,usage`. Drop any to hide it. The legacy name `sunmoon` still works and expands to `sun,rain`. The usage providers (`usage`=Claude, `codex`, `opencode`, `openrouter`) share the bottom strip and split it into one column each. |
+| `DASH_WIDGETS` | all | Comma list of panels to draw, in order: `clock,weather,forecast,agenda,sun,rain,usage,battery`. Drop any to hide it. The legacy name `sunmoon` still works and expands to `sun,rain`. The usage providers (`usage`=Claude, `codex`, `opencode`, `openrouter`) share the bottom strip and split it into one column each. `battery` shows the Kindle's charge in the top-right corner; it needs no config — `dashboard.sh` sends `?battery=&charging=` with each fetch, and the panel stays blank for any other client (e.g. a browser). |
 | `PORT` | `8810` | Host port the container publishes (compose). |
 | `DASH_FONT_DIR` | `/usr/share/fonts/truetype/dejavu` | Where the DejaVu TTFs live (the image ships them). |
 

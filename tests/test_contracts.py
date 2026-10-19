@@ -161,6 +161,28 @@ class RenderContract(unittest.TestCase):
 
         self.assertEqual(image.getpixel((102, 70)), 0)
 
+    def test_battery_query_parses_level_and_charging(self):
+        self.assertEqual(app.parse_battery({"battery": ["82"], "charging": ["1"]}), (82, True))
+        self.assertEqual(app.parse_battery({"battery": ["82"]}), (82, False))
+        for q in ({}, {"battery": ["n/a"]}, {"battery": ["150"]}):
+            self.assertIsNone(app.parse_battery(q))
+
+    def test_battery_hidden_when_device_does_not_report_it(self):
+        image = Image.new("L", (200, 30), 255)
+        app.w_battery(ImageDraw.Draw(image), (0, 0, 200, 30), None)
+        self.assertEqual(image.getextrema(), (255, 255))
+
+    def test_battery_glyph_fills_with_level(self):
+        def inside(pct):
+            image = Image.new("L", (200, 30), 255)
+            with mock.patch.object(app, "_font", return_value=ImageFont.load_default()):
+                app.w_battery(ImageDraw.Draw(image), (0, 0, 200, 30), (pct, False))
+            # Left end of the glyph's interior: filled at any non-zero level.
+            return image.getpixel((165, 15))
+
+        self.assertEqual(inside(100), 0)
+        self.assertEqual(inside(0), 255)
+
     def test_one_percent_usage_has_visible_fill_inside_outline(self):
         image = Image.new("L", (300, 300), 255)
         draw = ImageDraw.Draw(image)

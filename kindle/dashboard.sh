@@ -112,11 +112,26 @@ ensure_tailscale() {
   sleep 5  # let the proxy come up so this cycle's fetch has a chance
 }
 
+# Battery level for the dashboard's battery widget, as a query string
+# ("battery=82&charging=0"), or nothing if powerd doesn't report it.
+battery_query() {
+  lvl=$(lipc-get-prop com.lab126.powerd battLevel 2>/dev/null)
+  case "$lvl" in ''|*[!0-9]*) return ;; esac
+  chg=$(lipc-get-prop com.lab126.powerd isCharging 2>/dev/null)
+  [ "$chg" = 1 ] || chg=0
+  echo "battery=$lvl&charging=$chg"
+}
+
 fetch() {
+  url="$URL"
+  b=$(battery_query)
+  if [ -n "$b" ]; then
+    case "$URL" in *\?*) url="$URL&$b" ;; *) url="$URL?$b" ;; esac
+  fi
   if [ -n "$DASH_PROXY" ]; then
-    curl -s -m 30 -x "$DASH_PROXY" -o "$IMG" "$URL"
+    curl -s -m 30 -x "$DASH_PROXY" -o "$IMG" "$url"
   else
-    curl -s -m 30 -o "$IMG" "$URL"
+    curl -s -m 30 -o "$IMG" "$url"
   fi
 }
 
