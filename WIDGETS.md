@@ -29,6 +29,8 @@ w_aqi(d, (mid, mid_y, rcol, (mid_b - mid_y) * 0.5))
 
 Conventions: pure black on white (e-ink is sharpest at 1-bit — `DASH_DARK` inverts the whole frame for you, so always draw dark-on-light); size fonts as a fraction of `h`; truncate text with `_trunc()`; never raise out of a widget (one that raises is logged and skipped, but keep fetches fail-soft anyway).
 
+Per-request data from the device goes in the `/dash.png` query string instead of a fetch: `dashboard.sh` adds `battery=82&charging=0` (from `lipc-get-prop com.lab126.powerd`), `render()` passes it to `w_battery`, and the widget draws nothing when it is missing.
+
 ## Turning widgets on/off
 
 `DASH_WIDGETS` (env) lists which panels render, in order — drop any to hide it, e.g. `DASH_WIDGETS=clock,weather,usage`. No code change. Each name maps to a fixed box in `render()`.
@@ -56,7 +58,7 @@ Return shapes to match: weather `(condition, temp, feels)` · forecast `[(label,
 
 ## Shipped
 
-Clock · Weather (now) · Forecast (N-day) · Rain (HA hourly forecast, chance per hour) · Agenda (one or more HA calendars) · Sun (HA sunrise/sunset) · Claude usage (5h/7d/Extra) · Codex usage (available windows/Credits) · opencode Go usage (5h/Week/Month) · OpenRouter spend (Month USD).
+Clock · Weather (now) · Forecast (N-day) · Rain (HA hourly forecast, chance per hour) · Agenda (one or more HA calendars) · Sun (HA sunrise/sunset) · Kindle battery (sent by the device) · Claude usage (5h/7d/Extra) · Codex usage (available windows/Credits) · opencode Go usage (5h/Week/Month) · OpenRouter spend (Month USD).
 
 The four usage providers (`usage`=Claude, `codex`, `opencode`, `openrouter`) share one `_usage_block` renderer and split the bottom strip into a column each. Claude and Codex read OAuth usage APIs (refresh-token seeded); OpenRouter sums `usage_monthly` over all keys with a management key; **opencode has no usage API, so its widget scrapes the Go dashboard HTML** with a browser cookie — see CONFIGURATION.md for the fragility caveat.
 
@@ -74,7 +76,6 @@ The four usage providers (`usage`=Claude, `codex`, `opencode`, `openrouter`) sha
 | **Habit / streak** | a counter file / HA | low | "N days since X" |
 | **Air quality / pollen** | HA / AQI API | low | number + trend |
 | **Countdown** | a configured date | low | "12 days until …" |
-| **Kindle battery** | device-side (`gasgauge`/`lipc`) | low | drawn on-device or POSTed back |
 
 PRs that add a widget should keep it **optional** (no config → hidden) and **fail soft**. If it needs a new dependency, say why in the PR.
 
