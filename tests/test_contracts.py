@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from unittest import mock
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 from renderer import app
 from tools.release_version import next_version, release_kind
 from tools.update_servarr_pin import update_pin
@@ -182,6 +182,33 @@ class RenderContract(unittest.TestCase):
 
         self.assertEqual(inside(100), 0)
         self.assertEqual(inside(0), 255)
+
+    @unittest.skipUnless(
+        pathlib.Path(app.FONT_DIR, "DejaVuSans-Bold.ttf").exists(),
+        "needs the DejaVu fonts (DASH_FONT_DIR): the overlap depends on their widths",
+    )
+    def test_long_temperature_stays_clear_of_the_battery(self):
+        def frame(widgets, temp):
+            with (
+                mock.patch.object(app, "KINDLE_W", 1024),
+                mock.patch.object(app, "KINDLE_H", 758),
+                mock.patch.object(app, "DASH_WIDGETS", widgets),
+                mock.patch.dict(app.HA_DATA, {"weather": ("sunny", temp, temp)}),
+            ):
+                return Image.open(BytesIO(app.render(rotate=0, battery=(100, True))))
+
+        battery = frame(["battery"], 100)
+        # The battery with its bolt (the header row, above the first rule),
+        # plus the half-pad gap to its left.
+        x0, y0, x1, y1 = ImageOps.invert(battery.crop((0, 0, 1024, 150))).getbbox()
+        x0 -= max(16, 1024 // 42) // 2
+        # 100° (a °F afternoon) and -10° ran into the bolt before.
+        for temp in (100, -10, 21):
+            both = frame(["weather", "battery"], temp)
+            self.assertNotEqual(both.tobytes(), battery.tobytes())  # the temperature is drawn
+            self.assertEqual(
+                both.crop((x0, y0, x1, y1)).tobytes(), battery.crop((x0, y0, x1, y1)).tobytes(), temp
+            )
 
     def test_one_percent_usage_has_visible_fill_inside_outline(self):
         image = Image.new("L", (300, 300), 255)
