@@ -837,7 +837,10 @@ def w_clock(d, box):
     d.text((x, y + h * 0.66), now.strftime("%a - %d/%m/%Y"), font=_font(False, h * 0.2), fill=0)
 
 
-def w_weather(d, box):
+def w_weather(d, box, right=None):
+    """Icon, temperature, condition. The temperature ends left of `right`
+    (default: the box edge): its font shrinks for a long reading like 100° or
+    -10°, so it never runs into the battery that shares its row."""
     x, y, w, h = box
     cond, temp, feels = HA_DATA["weather"]
     r = h * 0.32
@@ -845,7 +848,14 @@ def w_weather(d, box):
     draw_weather_icon(d, cx, cy, r, cond if temp is not None else "cloudy")
     tx = cx + r + 16
     if temp is not None:
-        d.text((tx, y), f"{round(temp)}°", font=_font(True, h * 0.6), fill=0)
+        t = f"{round(temp)}°"
+        size = h * 0.6
+        # Keep the full-size baseline, so a smaller font stays on the same line.
+        base = y + _font(True, size).getmetrics()[0]
+        limit = (x + w if right is None else right) - tx
+        while size > h * 0.3 and d.textlength(t, font=_font(True, size)) > limit:
+            size -= 1
+        d.text((tx, base), t, font=_font(True, size), fill=0, anchor="ls")
         sub = cond or ""
         if feels is not None:
             sub = (sub + f"  feels {round(feels)}°").strip()
@@ -929,6 +939,27 @@ def w_rain(d, box):
     d.line((x, base, x + cw * len(hours), base), fill=0, width=2)
 
 
+def _battery_layout(d, box, pct):
+    """w_battery geometry: (glyph left, glyph right, text right, text font, text left)."""
+    x, y, w, h = box
+    nub = h * 0.7 * 0.15
+    bx1 = x + w - nub
+    bx0 = bx1 - h * 0.7 * 1.9
+    f = _font(False, h * 0.75)
+    tx = bx0 - h * 0.3
+    return bx0, bx1, tx, f, tx - d.textlength(f"{pct}%", font=f)
+
+
+def battery_left(d, box, battery):
+    """Left edge of what w_battery draws (the bolt or the text), or None."""
+    if battery is None:
+        return None
+    pct, charging = battery
+    h = box[3]
+    left = _battery_layout(d, box, pct)[4]
+    return left - h * 0.2 - h * 0.4 if charging else left
+
+
 def w_battery(d, box, battery=None):
     """Kindle battery, right-aligned: "82%" and a small filled battery glyph.
 
@@ -943,20 +974,17 @@ def w_battery(d, box, battery=None):
     lw = max(2, round(h * 0.09))
     bh = h * 0.7
     nub = bh * 0.15
-    bx1 = x + w - nub
-    bx0 = bx1 - bh * 1.9
+    bx0, bx1, tx, f, left = _battery_layout(d, box, pct)
     d.rectangle((bx0, cy - bh / 2, bx1, cy + bh / 2), outline=0, width=lw)
     d.rectangle((bx1, cy - bh * 0.22, bx1 + nub, cy + bh * 0.22), fill=0)
     gap = lw + 2
     fill = round((bx1 - bx0 - 2 * gap) * pct / 100)
     if fill:
         d.rectangle((bx0 + gap, cy - bh / 2 + gap, bx0 + gap + fill - 1, cy + bh / 2 - gap), fill=0)
-    f = _font(False, h * 0.75)
-    tx = bx0 - h * 0.3
     d.text((tx, cy), f"{pct}%", font=f, fill=0, anchor="rm")
     if charging:
         bw, bolt_h = h * 0.4, h * 0.7
-        ox = tx - d.textlength(f"{pct}%", font=f) - h * 0.2 - bw
+        ox = left - h * 0.2 - bw
         oy = cy - bolt_h / 2
         pts = [(0.6, 0), (0, 0.55), (0.45, 0.55), (0.35, 1), (1, 0.4), (0.55, 0.4)]
         d.polygon([(ox + px * bw, oy + py * bolt_h) for px, py in pts], fill=0)
@@ -1057,6 +1085,18 @@ def render(rotate=None, battery=None):
         cw = (W - 2 * pad - pad * (n - 1)) / n
         for i, name in enumerate(usage_on):
             boxes[name] = (pad + i * (cw + pad), strip_y, cw, H - strip_y - pad)
+    # The battery shares the top row with the temperature: the temperature
+    # stops half a pad left of it.
+    temp_right = None
+    if "battery" in DASH_WIDGETS:
+        try:
+            left = battery_left(d, boxes["battery"], battery)
+        except Exception as e:  # same isolation as the widget loop below
+            print(f"[widget] battery failed: {e}", flush=True)
+            left = None
+        if left is not None:
+            temp_right = left - pad / 2
+    extra = {"battery": (battery,), "weather": (temp_right,)}
     d.line((pad, H * 0.235, W - pad, H * 0.235), fill=0, width=2)
     d.line((pad, mid_b + pad, W - pad, mid_b + pad), fill=0, width=2)
     for name in DASH_WIDGETS:
@@ -1064,7 +1104,7 @@ def render(rotate=None, battery=None):
         if not (fn and box):
             continue
         try:
-            fn(d, box, battery) if name == "battery" else fn(d, box)
+            fn(d, box, *extra.get(name, ()))
         except Exception as e:
             print(f"[widget] {name} failed: {e}", flush=True)
 
