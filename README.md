@@ -33,9 +33,11 @@ A 6-inch e-ink screen is the *perfect* ambient display: paper-like, sunlight-rea
   ┌──────────── any always-on host the Kindle can reach (LAN) ───────────┐
   │  kindle-dash renderer (container, Python + Pillow)                   │
   │    • lays out a grid of WIDGETS, draws a grayscale PNG               │
-  │    • pulls: Home Assistant (weather/forecast/sun/agenda)             │
+  │    • pulls: Open-Meteo (weather/forecast/rain/sun, no key)           │
+  │            ICS / Home Assistant calendars (agenda)                   │
   │            Claude/Codex/OpenRouter usage API + opencode scrape       │
   │    • serves GET /dash.png  (plain HTTP — the Kindle can't do TLS)    │
+  │      and GET /location (set the city by hand while you travel)       │
   └───────────────────────────────┬──────────────────────────────────────┘
                                    │  http (LAN)
                 ┌──────────────────▼───────────────────┐

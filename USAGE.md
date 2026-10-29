@@ -21,6 +21,16 @@ Don't go sub-minute: the clock is minute-resolution, so faster only adds ghostin
 
 If a fetch fails (Wi-Fi blip, renderer restart) the **last good frame stays up** and it retries next cycle.
 
+## Set the location by hand (travel)
+
+Open `http://<renderer>:8810/location` in a phone browser (over Tailscale when you are away, e.g. `http://servarr:8810/location`). The page shows the current location and its source.
+
+1. Type a city in the search field and press **Search**.
+2. Select the correct match. The page shows the region, the country, and the time zone of each match.
+3. The dashboard shows the weather and the local time of that city on the next frame (about one minute), with `City (manual)` under the weather.
+
+The override stays until you press **Automatic location**, also after a restart. Use it when the automatic location is wrong, for example on a phone hotspot. Press **Automatic location** when you come home: a forgotten override keeps the `(manual)` mark on the dashboard as a reminder.
+
 ## Power & staying awake
 
 Preventing the screensaver + keeping Wi-Fi on drains faster than reading. For a wall dashboard, leave it on a USB charger — then it runs indefinitely.

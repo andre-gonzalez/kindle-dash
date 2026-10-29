@@ -52,6 +52,10 @@ The OpenRouter panel uses the documented `GET https://openrouter.ai/api/v1/keys`
 
 Opt-in: leave `OPENROUTER_MANAGEMENT_KEY` blank and none of it runs.
 
+## ICS calendar URLs are secrets
+
+A private ICS URL (for example Google's "secret address in iCal format") gives read access to the full calendar to anyone who has it. Treat each `DASH_ICS_URLS` entry as a credential: keep it in `renderer/.env` or your secret store, not in a committed compose file. The renderer never logs the URLs; a failed feed is logged by its number (`[ics] calendar 2 failed: HTTP 404`). If a URL leaks, reset it in the calendar settings (Google: "Reset" next to the secret address).
+
 ## Token handling
 
 - The refresh token is a credential. Keep `renderer/.env` out of git (it's in `.gitignore`) and off shared storage; use your platform's secret mechanism if you have one.
@@ -61,6 +65,8 @@ Opt-in: leave `OPENROUTER_MANAGEMENT_KEY` blank and none of it runs.
 ## Network exposure
 
 The renderer serves **plain HTTP** with **no authentication** — because the Kindle can't do TLS. Keep it on a trusted LAN. The reverse-proxy example restricts the vhost to private ranges (`allow`/`deny`); adjust to your network. Don't expose `/dash.png` to the internet — it may reveal your calendar, location (via weather), and usage.
+
+The `/location` page also has **no authentication**: anyone who can reach the renderer (your LAN, your tailnet) can see the current location and change it. The worst case is wrong weather and a wrong time zone on the dashboard until you press *Automatic location*. Keep the same network limits as for `/dash.png`.
 
 To use the Kindle away from home, reach the renderer over a **Tailscale tailnet** instead of opening a port (see [INSTALLATION.md](INSTALLATION.md#3-away-from-home-tailscale)). Tailnet traffic is WireGuard-encrypted, so plain HTTP is fine there. Add an ACL so the Kindle can reach only the renderer, e.g. with the Kindle tagged `tag:kindle`:
 
