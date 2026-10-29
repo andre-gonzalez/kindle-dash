@@ -10,6 +10,12 @@ Endpoints:
                               framebuffer when the device is mounted sideways.
      [&battery=82&charging=1] The device's battery, for the battery widget
                               (dashboard.sh sends it on every fetch).
+     [&ip=<public IPv4>]      The device's public IP, for the geo-IP location
+                              (dashboard.sh sends it too).
+  GET /location               Page to set the location by hand (a city search)
+                              or go back to the automatic location.
+  POST /location              The page's forms: action=set (lat, lon, tz,
+                              name) or action=auto.
   GET /healthz                Liveness probe.
 
 Layout is slot-based: render() lays out a grid of boxes and hands each to a
@@ -22,6 +28,7 @@ fetches fail soft: a missing source renders a placeholder, never a broken image.
 import base64
 import functools
 import html
+import ipaddress
 import json
 import math
 import os
@@ -29,11 +36,13 @@ import re
 import threading
 import time
 import zoneinfo
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from urllib.parse import parse_qs, urlparse
 
+import icalendar
+import recurring_ical_events
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -58,26 +67,41 @@ DASH_WIDGETS = [
 # rain chance); expand the legacy name so existing configs keep working.
 DASH_WIDGETS = [n for w in DASH_WIDGETS for n in (("sun", "rain") if w == "sunmoon" else (w,))]
 
-# Home Assistant (optional) — powers weather, forecast, rain, sun, and agenda widgets.
+# Home Assistant (optional) — powers the agenda widget.
 HA_BASE_URL = os.environ.get("HA_BASE_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
-HA_WEATHER_ENTITY = os.environ.get("HA_WEATHER_ENTITY", "")
 # Comma list: the agenda merges every calendar into one time-sorted list.
 HA_CALENDAR_ENTITIES = [
     c.strip() for c in os.environ.get("HA_CALENDAR_ENTITY", "").split(",") if c.strip()
 ]
-HA_SUN_ENTITY = os.environ.get("HA_SUN_ENTITY", "sun.sun")
+# ICS calendars (optional) — comma list of iCal URLs, e.g. Google's "secret
+# address in iCal format". They merge into the agenda with the HA calendars.
+# Each URL is a secret (it gives read access to the calendar): never log it.
+DASH_ICS_URLS = [u.strip() for u in os.environ.get("DASH_ICS_URLS", "").split(",") if u.strip()]
+# Geo-IP (optional): dashboard.sh sends the Kindle's public IPv4 as ip=. The
+# renderer looks it up at DASH_GEOIP_URL ("{ip}" = the address; the ipapi.co
+# JSON format, free, no key). The same IP as the renderer's own public IPv4
+# (DASH_PUBLIC_IP_URL, plain text) means home. DASH_GEOIP_URL= turns it off.
+DASH_GEOIP_URL = os.environ.get("DASH_GEOIP_URL", "https://ipapi.co/{ip}/json/")
+DASH_PUBLIC_IP_URL = os.environ.get("DASH_PUBLIC_IP_URL", "https://api.ipify.org")
+# ipapi.co answers 429 to the default python-requests User-Agent. Send one.
+DASH_GEOIP_USER_AGENT = os.environ.get("DASH_GEOIP_USER_AGENT", "kindle-dash")
+# City search on the /location page (Open-Meteo geocoding, free, no key).
+GEOCODING_URL = os.environ.get("GEOCODING_URL", "https://geocoding-api.open-meteo.com/v1/search")
+# Weather, forecast, rain chance, and sunrise/sunset come from Open-Meteo (free,
+# no key) at DASH_LAT/DASH_LON. RAIN_LAT/RAIN_LON are the old names (they set
+# the location of the old rain fallback). Units stay fixed: metric or imperial.
+OPEN_METEO_URL = os.environ.get("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
+DASH_LAT = os.environ.get("DASH_LAT") or os.environ.get("RAIN_LAT", "")
+DASH_LON = os.environ.get("DASH_LON") or os.environ.get("RAIN_LON", "")
+DASH_UNITS = os.environ.get("DASH_UNITS", "metric").lower()
+# Old HA weather vars: the renderer ignores them and warns once at start.
+OLD_WEATHER_VARS = ("HA_WEATHER_ENTITY", "HA_SUN_ENTITY")
 FORECAST_DAYS = int(os.environ.get("FORECAST_DAYS", "3"))
 RAIN_HOURS = int(os.environ.get("RAIN_HOURS", "12"))  # columns in the rain chart
-# Rain chance falls back to Open-Meteo (free, no key) when the HA weather entity
-# has no hourly precipitation_probability (e.g. Met.no). The location defaults
-# to HA's home coordinates; RAIN_LAT/RAIN_LON override it.
-OPEN_METEO_URL = os.environ.get("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
-RAIN_LAT = os.environ.get("RAIN_LAT", "")
-RAIN_LON = os.environ.get("RAIN_LON", "")
 MAX_EVENTS = int(os.environ.get("DASH_MAX_EVENTS", "4"))
 EVENT_GRACE_MIN = int(os.environ.get("DASH_EVENT_GRACE_MIN", "15"))  # past-event hide delay
-DASH_POLL_MIN = int(os.environ.get("DASH_POLL_MIN", "5"))  # HA refresh cadence
+DASH_POLL_MIN = int(os.environ.get("DASH_POLL_MIN", "5"))  # weather + agenda refresh cadence
 
 # Claude usage (optional) — fetched from the OAuth usage API; the short-lived
 # access token is refreshed from a seeded refresh token (its OWN login — see
@@ -144,6 +168,219 @@ def _font(bold, size):
     return ImageFont.truetype(os.path.join(FONT_DIR, name), int(size))
 
 
+# --- location: the weather, the time zone, and the city line follow it ------
+# A location is {"lat", "lon", "tz" (IANA name), "name", "source"}; source is
+# "manual" (an override), "geoip" (the Kindle's public IP), or "home"
+# (DASH_LAT/DASH_LON + TZ). The override and the last geo-IP location persist
+# in LOCATION_FILE, so a restart or a failed lookup does not jump home. The
+# last location expires after LAST_MAX_AGE.
+LOCATION_FILE = os.path.join(STATE_DIR, "location.json")
+LAST_MAX_AGE = 24 * 3600  # seconds; the ipapi.co terms allow 24 h at most
+
+
+def valid_location(loc, source=None):
+    """loc as a clean location dict (with `source` if given), or None if it is not one."""
+    try:
+        lat, lon = float(loc["lat"]), float(loc["lon"])
+        zoneinfo.ZoneInfo(loc["tz"])
+    except Exception:
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return {"lat": lat, "lon": lon, "tz": loc["tz"], "name": str(loc.get("name") or ""),
+            "source": source or str(loc.get("source") or "")}
+
+
+HOME = valid_location({"lat": DASH_LAT, "lon": DASH_LON, "tz": TZ}, "home")
+
+
+def resolve_location(override, geo, last, home):
+    """The current location: the override, else the geo-IP location, else the
+    last known one, else home. Or None when none of them exists."""
+    if override:
+        return {**override, "source": "manual"}
+    return geo or last or home
+
+
+def load_location(path=None):
+    """{"override", "last", "last_saved"} from the state file. The override is a
+    location or None. The last location is None if it is older than
+    LAST_MAX_AGE (the geo-IP terms allow no older copy)."""
+    try:
+        with open(path or LOCATION_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    saved = data.get("last_saved")
+    fresh = isinstance(saved, (int, float)) and time.time() - saved < LAST_MAX_AGE
+    last = valid_location(data.get("last") or {}) if fresh else None
+    return {"override": valid_location(data.get("override") or {}, "manual"),
+            "last": last, "last_saved": saved if last else None}
+
+
+def save_location(state, path=None):
+    path = path or LOCATION_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+LOCATION = load_location()
+GEO_LOCATION = None  # geo-IP location of the Kindle's current IP, when known
+# Set when the current location changes: data_poll_loop fetches at once.
+POLL_WAKE = threading.Event()
+
+
+def current_location():
+    saved = LOCATION.get("last_saved") or 0
+    last = LOCATION["last"] if time.time() - saved < LAST_MAX_AGE else None
+    return resolve_location(LOCATION["override"], GEO_LOCATION, last, HOME)
+
+
+def update_location(**changes):
+    """Change the stored override and/or last location, persist them, and wake
+    the data poll if the current location changed. A new last location gets
+    the current time as last_saved, unless the change gives one."""
+    global LOCATION
+    before = current_location()
+    if changes.get("last") and "last_saved" not in changes:
+        changes["last_saved"] = time.time()
+    LOCATION = {**LOCATION, **changes}
+    try:
+        save_location(LOCATION)
+    except Exception as e:  # keep the change in memory; it is lost on restart
+        print(f"[location] save failed: {e}", flush=True)
+    if current_location() != before:
+        POLL_WAKE.set()
+
+
+def set_geo_location(geo, fetched=None):
+    """Use geo as the Kindle's geo-IP location (None = not known), looked up at
+    time fetched. A geo-IP location also becomes the last known one; home
+    clears it, so a later failed lookup falls back to home. Wakes the data
+    poll on a change."""
+    global GEO_LOCATION
+    before = current_location()
+    GEO_LOCATION = geo
+    if geo and geo["source"] == "geoip":
+        update_location(last=geo, last_saved=fetched or time.time())
+    elif geo:
+        update_location(last=None, last_saved=None)
+    if current_location() != before:
+        POLL_WAKE.set()
+
+
+def location_tz(loc):
+    """Time zone of a location; TZ at home or with no location."""
+    if not loc or loc["source"] == "home":
+        return TZINFO
+    return zoneinfo.ZoneInfo(loc["tz"])
+
+
+def local_tz():
+    """Time zone of the current location (see location_tz)."""
+    return location_tz(current_location())
+
+
+# --- geo-IP: where the Kindle is, from the public IP that dashboard.sh sends -
+# The handler only records the IP (note_kindle_ip); geoip_loop does the slow
+# lookups, so a slow API never delays a frame. Results are cached for each IP
+# for GEOIP_CACHE_SEC (well under the 24 h that the ipapi.co terms allow).
+GEOIP_CACHE_SEC = 12 * 3600
+GEOIP_RETRY_SEC = 15 * 60  # after a failed lookup, for the same IP
+OWN_IP_SEC = 30 * 60       # how long the renderer's own public IP is reused
+KINDLE_IP = None
+GEOIP_WAKE = threading.Event()
+_GEOIP_CACHE = {}  # ip -> (fetched_at, location-or-None)
+_OWN_IP = (0.0, None)
+
+
+def public_ip(text):
+    """text as a normalized public (global) IP address, or None."""
+    try:
+        ip = ipaddress.ip_address(str(text).strip())
+    except ValueError:
+        return None
+    return str(ip) if ip.is_global else None
+
+
+def note_kindle_ip(text):
+    """Record the Kindle's public IP from a /dash.png request; wake the geo-IP
+    lookup if it changed. A missing or bad value keeps the current location."""
+    global KINDLE_IP
+    ip = public_ip(text)
+    if ip and ip != KINDLE_IP:
+        KINDLE_IP = ip
+        GEOIP_WAKE.set()
+
+
+def parse_geoip(data):
+    """A "geoip" location from an ipapi.co-style response, or None (error or no data)."""
+    if not isinstance(data, dict) or data.get("error"):
+        return None
+    name = data.get("city") or data.get("region") or data.get("country_name") or ""
+    return valid_location({"lat": data.get("latitude"), "lon": data.get("longitude"),
+                           "tz": data.get("timezone"), "name": name}, "geoip")
+
+
+def geoip_lookup(ip, now=None):
+    """(location-or-None, fetched_at) for ip, from the cache or DASH_GEOIP_URL."""
+    now = now or time.time()
+    hit = _GEOIP_CACHE.get(ip)
+    if hit and now - hit[0] < (GEOIP_CACHE_SEC if hit[1] else GEOIP_RETRY_SEC):
+        return hit[1], hit[0]
+    loc = None
+    try:
+        r = requests.get(DASH_GEOIP_URL.format(ip=ip), timeout=8,
+                         headers={"User-Agent": DASH_GEOIP_USER_AGENT})
+        r.raise_for_status()
+        loc = parse_geoip(r.json())
+        if not loc:
+            print(f"[geoip] no location for {ip}: {r.json().get('reason', '')}", flush=True)
+    except Exception as e:
+        print(f"[geoip] lookup failed: {e}", flush=True)
+    for k in [k for k, (t, _) in _GEOIP_CACHE.items() if now - t > GEOIP_CACHE_SEC]:
+        del _GEOIP_CACHE[k]
+    _GEOIP_CACHE[ip] = (now, loc)
+    return loc, now
+
+
+def own_public_ip(now=None):
+    """The renderer's own public IPv4 (cached for OWN_IP_SEC), or None."""
+    global _OWN_IP
+    now = now or time.time()
+    if _OWN_IP[1] and now - _OWN_IP[0] < OWN_IP_SEC:
+        return _OWN_IP[1]
+    try:
+        r = requests.get(DASH_PUBLIC_IP_URL, timeout=8)
+        r.raise_for_status()
+        _OWN_IP = (now, public_ip(r.text))
+    except Exception as e:
+        print(f"[geoip] own IP lookup failed: {e}", flush=True)
+        _OWN_IP = (now, None)
+    return _OWN_IP[1]
+
+
+def locate(ip):
+    """(location-or-None, fetched_at) for the Kindle at ip: home when ip is the
+    renderer's own public IP (the home network), else the geo-IP location."""
+    if HOME and ip == own_public_ip():
+        return HOME, time.time()
+    return geoip_lookup(ip)
+
+
+def geoip_loop():
+    while True:
+        GEOIP_WAKE.clear()  # before the lookup: a new IP during it looks up again
+        if KINDLE_IP:
+            loc, fetched = locate(KINDLE_IP)
+            set_geo_location(loc, fetched)
+        # Wake on a new IP; else look again, for a changed own IP or an expired entry.
+        GEOIP_WAKE.wait(OWN_IP_SEC)
+
+
 # --- Home Assistant helpers ------------------------------------------------
 def _ha(method, path, body=None, **params):
     if not (HA_BASE_URL and HA_TOKEN):
@@ -167,125 +404,117 @@ def _ha(method, path, body=None, **params):
 def _local(iso):
     """Parse an ISO timestamp to local tz, or None."""
     try:
-        return datetime.fromisoformat(iso).astimezone(TZINFO)
+        return datetime.fromisoformat(iso).astimezone(local_tz())
     except Exception:
         return None
 
 
-def fetch_weather():
-    """(condition, temp, feels) or (None, None, None)."""
-    data = _ha("GET", f"/api/states/{HA_WEATHER_ENTITY}") if HA_WEATHER_ENTITY else None
-    if not data:
-        return None, None, None
-    a = data.get("attributes", {})
-    return data.get("state"), a.get("temperature"), a.get("apparent_temperature")
+# WMO weather code -> the HA condition names that draw_weather_icon and the
+# weather line use (the same map as the HA Open-Meteo integration).
+WMO_CONDITIONS = {
+    0: "sunny", 1: "sunny", 2: "partlycloudy", 3: "cloudy", 45: "fog", 48: "fog",
+    51: "rainy", 53: "rainy", 55: "rainy", 56: "snowy-rainy", 57: "snowy-rainy",
+    61: "rainy", 63: "rainy", 65: "pouring", 66: "snowy-rainy", 67: "snowy-rainy",
+    71: "snowy", 73: "snowy", 75: "snowy", 77: "snowy",
+    80: "rainy", 81: "rainy", 82: "pouring", 85: "snowy", 86: "snowy",
+    95: "lightning", 96: "lightning-rainy", 99: "lightning-rainy",
+}
 
 
-def fetch_forecast():
-    """List of (label, condition, hi, lo) for the next days, or None."""
-    if not HA_WEATHER_ENTITY:
-        return None
-    resp = _ha(
-        "POST",
-        "/api/services/weather/get_forecasts",
-        {"entity_id": HA_WEATHER_ENTITY, "type": "daily"},
-        return_response="true",
-    )
+def wmo_condition(code, is_day=True):
+    """HA condition name for a WMO weather code, or None. A clear night is 'clear-night'."""
+    cond = WMO_CONDITIONS.get(code)
+    if cond == "sunny" and not is_day:
+        return "clear-night"
+    return cond
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) else None
+
+
+def parse_open_meteo(data, now=None, tz=None):
+    """Weather, forecast, hourly rain, and sun from an Open-Meteo unixtime response.
+
+    {"weather": (condition, temp, feels), "forecast": [(label, condition, hi, lo)]
+    or None, "hourly": [(local_dt, rain_pct-or-None)] or None, "sun":
+    (sunrise_dt, sunset_dt)}, or None if the response has no usable data. Sun
+    times are the next sunrise and the next sunset after now, as HA's sun.sun
+    gave them. Times are in tz (default: the current location's).
+    """
+    tz = tz or local_tz()
+    now = now or datetime.now(tz)
     try:
-        days = resp["service_response"][HA_WEATHER_ENTITY]["forecast"]
+        cur, daily, hourly = data["current"], data["daily"], data["hourly"]
     except Exception:
         return None
-    out = []
-    for f in days[:FORECAST_DAYS]:
-        dt = _local(f.get("datetime"))
-        out.append((dt.strftime("%a") if dt else "", f.get("condition"),
-                    f.get("temperature"), f.get("templow")))
-    return out or None
-
-
-def parse_hourly(resp, entity):
-    """[(local_dt, rain_pct-or-None)] from a get_forecasts hourly response, or None."""
     try:
-        hours = resp["service_response"][entity]["forecast"]
+        weather = (
+            wmo_condition(cur.get("weather_code"), cur.get("is_day", 1)),
+            _num(cur.get("temperature_2m")),
+            _num(cur.get("apparent_temperature")),
+        )
     except Exception:
-        return None
-    out = []
-    for f in hours:
-        dt = _local(f.get("datetime"))
-        if dt is None:
-            continue
-        pct = f.get("precipitation_probability")
-        out.append((dt, round(pct) if isinstance(pct, (int, float)) else None))
-    return out or None
-
-
-def parse_open_meteo(data):
-    """[(local_dt, rain_pct-or-None)] from an Open-Meteo unixtime response, or None."""
+        weather = (None, None, None)
     try:
-        h = data["hourly"]
-        pairs = list(zip(h["time"], h["precipitation_probability"]))
+        days = zip(daily["time"], daily["weather_code"],
+                   daily["temperature_2m_max"], daily["temperature_2m_min"])
+        forecast = [
+            (datetime.fromtimestamp(t, tz).strftime("%a"), wmo_condition(code),
+             _num(hi), _num(lo))
+            for t, code, hi, lo in days
+        ][:FORECAST_DAYS] or None
     except Exception:
+        forecast = None
+    try:
+        hours = [
+            (datetime.fromtimestamp(t, tz), round(p) if isinstance(p, (int, float)) else None)
+            for t, p in zip(hourly["time"], hourly["precipitation_probability"])
+        ] or None
+    except Exception:
+        hours = None
+    try:
+        def next_after(times):
+            return next((datetime.fromtimestamp(t, tz) for t in times
+                         if isinstance(t, (int, float)) and t > now.timestamp()), None)
+        sun = (next_after(daily["sunrise"]), next_after(daily["sunset"]))
+    except Exception:
+        sun = (None, None)
+    if weather[1] is None and not forecast and not hours and sun == (None, None):
         return None
-    out = [
-        (datetime.fromtimestamp(t, TZINFO), round(p) if isinstance(p, (int, float)) else None)
-        for t, p in pairs
-    ]
-    return out or None
+    return {"weather": weather, "forecast": forecast, "hourly": hours, "sun": sun}
 
 
-def fetch_open_meteo():
-    """Hourly rain probability from Open-Meteo (see parse_open_meteo), or None."""
-    if RAIN_LAT and RAIN_LON:
-        lat, lon = RAIN_LAT, RAIN_LON
-    else:
-        cfg = _ha("GET", "/api/config") or {}
-        lat, lon = cfg.get("latitude"), cfg.get("longitude")
-    if lat is None or lon is None:
+def fetch_open_meteo(loc):
+    """Weather, forecast, hourly rain, and sun at location loc from Open-Meteo
+    (see parse_open_meteo), or None."""
+    if not loc:
         return None
     try:
         r = requests.get(
             OPEN_METEO_URL,
             params={
-                "latitude": lat, "longitude": lon,
-                "hourly": "precipitation_probability", "timeformat": "unixtime",
-                "forecast_days": 1 + -(-RAIN_HOURS // 24),  # today + enough to cover RAIN_HOURS
+                "latitude": loc["lat"], "longitude": loc["lon"],
+                "current": "temperature_2m,apparent_temperature,weather_code,is_day",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset",
+                "hourly": "precipitation_probability",
+                "temperature_unit": "fahrenheit" if DASH_UNITS == "imperial" else "celsius",
+                "timezone": loc["tz"], "timeformat": "unixtime",
+                # The forecast strip, tomorrow's sunrise after today's sunset,
+                # and enough hours from now to fill RAIN_HOURS.
+                "forecast_days": max(FORECAST_DAYS, 2, 1 + -(-RAIN_HOURS // 24)),
             },
             timeout=8,
         )
         r.raise_for_status()
-        return parse_open_meteo(r.json())
+        return parse_open_meteo(r.json(), tz=location_tz(loc))
     except Exception as e:
         print(f"[open-meteo] fetch failed: {e}", flush=True)
         return None
 
 
-def fetch_hourly():
-    """Hourly rain probability: the HA weather entity, else Open-Meteo. Or None."""
-    hours = None
-    if HA_WEATHER_ENTITY:
-        resp = _ha(
-            "POST",
-            "/api/services/weather/get_forecasts",
-            {"entity_id": HA_WEATHER_ENTITY, "type": "hourly"},
-            return_response="true",
-        )
-        hours = parse_hourly(resp, HA_WEATHER_ENTITY)
-    if hours and any(pct is not None for _, pct in hours):
-        return hours
-    return fetch_open_meteo() or hours
-
-
-def fetch_sun():
-    """(sunrise_dt, sunset_dt) in local tz, or (None, None)."""
-    data = _ha("GET", f"/api/states/{HA_SUN_ENTITY}") if HA_SUN_ENTITY else None
-    if not data:
-        return None, None
-    a = data.get("attributes", {})
-    return _local(a.get("next_rising")), _local(a.get("next_setting"))
-
-
 def parse_events(calendars, start):
-    """Merge HA calendar event lists into [(shown_dt, HH:MM-or-'all day', summary)].
+    """Merge calendar event lists into [(shown_dt, HH:MM-or-'all day', summary)].
 
     Time-sorted, all-day events first. An event that is on more than one
     calendar (e.g. a meeting invite) shows once. A timed event that began
@@ -317,7 +546,7 @@ def visible_events(events, now):
     """The first MAX_EVENTS agenda rows as [(label, summary)].
 
     A timed event hides EVENT_GRACE_MIN after its shown time (an 08:00 event
-    shows until 08:15). This runs at render time, not in the HA poll, so an
+    shows until 08:15). This runs at render time, not in the data poll, so an
     event hides on time even between polls.
     """
     grace = timedelta(minutes=EVENT_GRACE_MIN)
@@ -325,42 +554,84 @@ def visible_events(events, now):
     return rows[:MAX_EVENTS]
 
 
-def fetch_events():
-    """Today's events from every HA_CALENDAR_ENTITY (see parse_events), or None."""
-    if not HA_CALENDAR_ENTITIES:
+def parse_ics(text, start):
+    """Events of one iCal feed between start and start + 1 day, or raise.
+
+    Each event is in the HA calendar event format ({"start": {"dateTime"} or
+    {"date"}, "end": ..., "summary"}), so parse_events merges ICS and HA
+    calendars. Repeat events expand (RRULE, EXDATE, moved instances). A
+    cancelled event is left out. A time with no zone is local time.
+    """
+    def when(prop):
+        v = prop.dt if prop is not None else None
+        if isinstance(v, datetime):
+            return {"dateTime": (v if v.tzinfo else v.replace(tzinfo=local_tz())).isoformat()}
+        if isinstance(v, date):
+            return {"date": v.isoformat()}
+        return {}
+
+    cal = icalendar.Calendar.from_ical(text)
+    return [
+        {"start": when(ev.get("DTSTART")), "end": when(ev.get("DTEND")),
+         "summary": str(ev.get("SUMMARY", ""))}
+        for ev in recurring_ical_events.of(cal).between(start, start + timedelta(days=1))
+        if str(ev.get("STATUS", "")).upper() != "CANCELLED"
+    ]
+
+
+def fetch_ics(n, url, start):
+    """Today's events from the n-th DASH_ICS_URLS feed (see parse_ics), or None.
+
+    The log names the feed by its number, never by its URL (a secret).
+    """
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        return parse_ics(r.text, start)
+    except requests.HTTPError as e:
+        print(f"[ics] calendar {n} failed: HTTP {e.response.status_code}", flush=True)
+    except Exception as e:
+        print(f"[ics] calendar {n} failed: {type(e).__name__}", flush=True)
+    return None
+
+
+def fetch_events(now=None):
+    """Today's events from every HA_CALENDAR_ENTITY and DASH_ICS_URLS feed (see
+    parse_events), or None."""
+    if not (HA_CALENDAR_ENTITIES or DASH_ICS_URLS):
         return None
-    now = datetime.now(TZINFO)
+    now = now or datetime.now(local_tz())
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     params = {"start": start.isoformat(), "end": (start + timedelta(days=1)).isoformat()}
     calendars = [_ha("GET", f"/api/calendars/{c}", **params) for c in HA_CALENDAR_ENTITIES]
+    calendars += [fetch_ics(n, url, start) for n, url in enumerate(DASH_ICS_URLS, 1)]
     calendars = [data for data in calendars if data is not None]
     if not calendars:  # every fetch failed; [] is a real "nothing today"
         return None
     return parse_events(calendars, start)
 
 
-# --- HA data cache: a background thread keeps render() free of network I/O --
-# render() runs on every GET /dash.png (~once a minute); doing the four HA
-# fetches there would block the response on serial network calls. Instead poll
-# them in the background and have the widgets read this snapshot (rebound
-# atomically, so a reader always sees one consistent dict).
-HA_DATA = {
-    "weather": (None, None, None), "forecast": None, "hourly": None,
-    "sun": (None, None), "events": None,
-}
+# --- data cache: a background thread keeps render() free of network I/O ----
+# render() runs on every GET /dash.png (~once a minute); doing the weather and
+# calendar fetches there would block the response on serial network calls.
+# Instead poll them in the background and have the widgets read this snapshot
+# (rebound atomically, so a reader always sees one consistent dict).
+# "location" is the location that the weather is for (the city line shows it).
+NO_WEATHER = {"weather": (None, None, None), "forecast": None, "hourly": None, "sun": (None, None)}
+DATA = {**NO_WEATHER, "events": None, "location": None}
 
 
-def ha_poll_loop():
-    global HA_DATA
+def poll_once():
+    global DATA
+    loc = current_location()
+    DATA = {**(fetch_open_meteo(loc) or NO_WEATHER), "events": fetch_events(), "location": loc}
+
+
+def data_poll_loop():
     while True:
-        HA_DATA = {
-            "weather": fetch_weather(),
-            "forecast": fetch_forecast(),
-            "hourly": fetch_hourly(),
-            "sun": fetch_sun(),
-            "events": fetch_events(),
-        }
-        time.sleep(DASH_POLL_MIN * 60)
+        POLL_WAKE.clear()  # before the fetch: a change during it polls again
+        poll_once()
+        POLL_WAKE.wait(DASH_POLL_MIN * 60)
 
 
 # --- Claude usage: OAuth token refresh + usage fetch -----------------------
@@ -431,7 +702,7 @@ def parse_claude_usage(data, now=None):
         if not iso:
             return ""
         try:
-            return datetime.fromisoformat(iso).astimezone(TZINFO).strftime("%b %d, %H:%M")
+            return datetime.fromisoformat(iso).astimezone(local_tz()).strftime("%b %d, %H:%M")
         except Exception:
             return ""
 
@@ -511,7 +782,7 @@ def _reset_fmt(seconds=None, at=None, now=None):
             dt = datetime.fromtimestamp(v, timezone.utc)
         else:
             return ""
-        return dt.astimezone(TZINFO).strftime("%b %d, %H:%M")
+        return dt.astimezone(local_tz()).strftime("%b %d, %H:%M")
     except Exception:
         return ""
 
@@ -832,17 +1103,18 @@ def parse_battery(q):
 # --- widgets: each draws inside box = (x, y, w, h) -------------------------
 def w_clock(d, box):
     x, y, w, h = box
-    now = datetime.now(TZINFO)
+    now = datetime.now(local_tz())
     d.text((x, y), now.strftime("%H:%M"), font=_font(True, h * 0.62), fill=0)
     d.text((x, y + h * 0.66), now.strftime("%a - %d/%m/%Y"), font=_font(False, h * 0.2), fill=0)
 
 
 def w_weather(d, box, right=None):
-    """Icon, temperature, condition. The temperature ends left of `right`
-    (default: the box edge): its font shrinks for a long reading like 100° or
-    -10°, so it never runs into the battery that shares its row."""
+    """Icon, temperature, condition, and the city line away from home (see
+    location_label). The temperature ends left of `right` (default: the box
+    edge): its font shrinks for a long reading like 100° or -10°, so it never
+    runs into the battery that shares its row."""
     x, y, w, h = box
-    cond, temp, feels = HA_DATA["weather"]
+    cond, temp, feels = DATA["weather"]
     r = h * 0.32
     cx, cy = x + r * 1.5, y + h * 0.42
     draw_weather_icon(d, cx, cy, r, cond if temp is not None else "cloudy")
@@ -862,11 +1134,24 @@ def w_weather(d, box, right=None):
         d.text((tx, y + h * 0.62), sub, font=_font(False, h * 0.16), fill=0)
     else:
         d.text((tx, y + h * 0.3), "weather n/a", font=_font(False, h * 0.18), fill=0)
+    label = location_label(DATA.get("location"))
+    if label:
+        f = _font(False, h * 0.13)
+        d.text((tx, y + h * 0.82), _trunc(d, label, f, x + w - tx), font=f, fill=0)
+
+
+def location_label(loc):
+    """The city line under the weather: the name ('(manual)' for an override),
+    or '' at home, where the dashboard looks as it did before travel support."""
+    if not loc or loc["source"] == "home":
+        return ""
+    name = loc["name"] or f"{loc['lat']:.2f}, {loc['lon']:.2f}"
+    return f"{name} (manual)" if loc["source"] == "manual" else name
 
 
 def w_forecast(d, box):
     x, y, w, h = box
-    days = HA_DATA["forecast"]
+    days = DATA["forecast"]
     if not days:
         return
     cw = w / len(days)
@@ -884,12 +1169,12 @@ def w_agenda(d, box):
     x, y, w, h = box
     d.text((x, y), "TODAY", font=_font(True, h * 0.14), fill=0)
     yy = y + h * 0.2
-    events = HA_DATA["events"]
+    events = DATA["events"]
     f = _font(False, h * 0.13)
     if events is None:
         d.text((x, yy), "no calendar", font=f, fill=0)
         return
-    events = visible_events(events, datetime.now(TZINFO))
+    events = visible_events(events, datetime.now(local_tz()))
     if not events:
         d.text((x, yy), "nothing scheduled", font=f, fill=0)
         return
@@ -902,7 +1187,7 @@ def w_agenda(d, box):
 
 def w_sun(d, box):
     x, y, w, h = box
-    rise, sett = HA_DATA["sun"]
+    rise, sett = DATA["sun"]
     f = _font(False, h * 0.62)
     d.text((x, y), "SUN", font=_font(True, h * 0.62), fill=0)
     d.text((x + w * 0.14, y), f"^ {rise.strftime('%H:%M')}" if rise else "^ --", font=f, fill=0)
@@ -914,13 +1199,13 @@ def w_rain(d, box):
     x, y, w, h = box
     d.text((x, y), "RAIN CHANCE", font=_font(True, h * 0.14), fill=0)
     f = _font(False, h * 0.14)
-    now = datetime.now(TZINFO).replace(minute=0, second=0, microsecond=0)
-    hours = [(dt, pct) for dt, pct in HA_DATA["hourly"] or [] if dt >= now][:RAIN_HOURS]
+    now = datetime.now(local_tz()).replace(minute=0, second=0, microsecond=0)
+    hours = [(dt, pct) for dt, pct in DATA["hourly"] or [] if dt >= now][:RAIN_HOURS]
     if not hours:
         d.text((x, y + h * 0.25), "rain n/a", font=f, fill=0)
         return
-    # Fixed pitch (not w/len(hours)) so bars keep their width when HA returns
-    # fewer hours than RAIN_HOURS.
+    # Fixed pitch (not w/len(hours)) so bars keep their width when the source
+    # returns fewer hours than RAIN_HOURS.
     cw = w / RAIN_HOURS
     bw = cw * 0.6
     top, base = y + h * 0.40, y + h * 0.80
@@ -1117,11 +1402,111 @@ def render(rotate=None, battery=None):
     return buf.getvalue()
 
 
+# --- /location page: set the location by hand (no auth, see SECURITY.md) ---
+def parse_geocoding(data):
+    """Up to 5 matches [{"lat", "lon", "tz", "name", "region"}] from an
+    Open-Meteo geocoding response; [] for no match. A match with no valid
+    time zone is left out."""
+    out = []
+    for r in (data or {}).get("results") or []:
+        loc = valid_location({"lat": r.get("latitude"), "lon": r.get("longitude"),
+                              "tz": r.get("timezone"), "name": r.get("name")}, "manual")
+        if loc and loc["name"]:
+            region = ", ".join(str(p) for p in (r.get("admin1"), r.get("country")) if p)
+            out.append({**loc, "region": region})
+    return out[:5]
+
+
+def search_cities(q):
+    """City matches for q (see parse_geocoding), or None if the search failed."""
+    try:
+        r = requests.get(GEOCODING_URL, params={"name": q, "count": 5, "format": "json"}, timeout=8)
+        r.raise_for_status()
+        return parse_geocoding(r.json())
+    except Exception as e:
+        print(f"[geocoding] search failed: {e}", flush=True)
+        return None
+
+
+def location_page(loc, q="", results=None):
+    """The /location HTML: the current location, a city search, and the
+    search results (None = the search failed). Plain HTML, no JavaScript."""
+    e = html.escape
+    if not loc:
+        now = "no location (set DASH_LAT/DASH_LON, or search below)"
+    elif loc["source"] == "home":
+        now = "home"
+    else:
+        how = {"manual": "manual override", "geoip": "from the Kindle's IP"}.get(loc["source"], "")
+        now = f"{e(loc['name'] or 'unnamed place')} — {how}"
+    if loc:
+        now += f"<br><small>{loc['lat']:.4f}, {loc['lon']:.4f} · {e(loc['tz'])}</small>"
+    rows = ""
+    if q and results is None:
+        rows = "<p>The search failed. Try again.</p>"
+    elif q and not results:
+        rows = f"<p>No match for “{e(q)}”.</p>"
+    for r in results or []:
+        rows += (
+            '<form method="post" action="/location"><input type="hidden" name="action" value="set">'
+            + "".join(f'<input type="hidden" name="{k}" value="{e(str(r[k]))}">'
+                      for k in ("lat", "lon", "tz", "name"))
+            + f'<button>{e(r["name"])}<br><small>{e(r["region"])} · {e(r["tz"])}</small></button></form>'
+        )
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kindle-dash location</title>
+<style>body{{font-family:sans-serif;max-width:32em;margin:1em auto;padding:0 1em}}
+input,button{{font-size:1em;padding:.5em}}form{{margin:.5em 0}}
+button{{width:100%;text-align:left}}small{{color:#555}}</style></head>
+<body><h1>Location</h1>
+<p>Now: {now}</p>
+<form method="post" action="/location"><input type="hidden" name="action" value="auto">
+<button>Automatic location<br><small>clear the manual override</small></button></form>
+<h2>Set a city</h2>
+<form method="get" action="/location"><input name="q" value="{e(q)}" placeholder="City" required>
+<input type="submit" value="Search"></form>
+{rows}
+</body></html>
+"""
+
+
+def location_post(form):
+    """Apply a /location form ({name: [value]}): set or clear the override.
+    Returns True, or False for a bad form."""
+    action = form.get("action", [""])[0]
+    if action == "auto":
+        update_location(override=None)
+        return True
+    if action == "set":
+        loc = valid_location({k: form.get(k, [""])[0] for k in ("lat", "lon", "tz", "name")}, "manual")
+        if loc and loc["name"]:
+            update_location(override=loc)
+            return True
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _send(self, code, body=b"", ctype="text/html; charset=utf-8", headers=()):
+        self.send_response(code)
+        for k, v in headers:
+            self.send_header(k, v)
+        if body:
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        url = urlparse(self.path)
+        if url.path == "/location":
+            q = parse_qs(url.query).get("q", [""])[0].strip()[:100]
+            results = search_cities(q) if q else []
+            self._send(200, location_page(current_location(), q, results).encode())
+            return
         if self.path == "/healthz":
             self.send_response(200)
             self.end_headers()
@@ -1133,6 +1518,8 @@ class Handler(BaseHTTPRequestHandler):
                 rotate = int(q["rotate"][0]) if "rotate" in q else None
             except ValueError:
                 rotate = None
+            if DASH_GEOIP_URL:
+                note_kindle_ip(q.get("ip", [""])[0])
             try:
                 png = render(rotate, parse_battery(q))
             except Exception as e:
@@ -1150,11 +1537,36 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(404)
         self.end_headers()
 
+    def do_POST(self):
+        if urlparse(self.path).path != "/location":
+            self._send(404)
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if not 0 <= n <= 4096:
+            self._send(400, b"bad request", "text/plain")
+            return
+        form = parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+        if not location_post(form):
+            self._send(400, b"bad request", "text/plain")
+            return
+        # Post/redirect/get: a reload does not post again.
+        self._send(303, headers=[("Location", "/location")])
+
 
 if __name__ == "__main__":
     print(f"kindle-dash on :8080  ({KINDLE_W}x{KINDLE_H}, tz={TZ})", flush=True)
-    if HA_BASE_URL or (RAIN_LAT and RAIN_LON):
-        threading.Thread(target=ha_poll_loop, daemon=True).start()
+    for var in OLD_WEATHER_VARS:
+        if os.environ.get(var):
+            print(f"[config] {var} is ignored: weather and sun come from Open-Meteo "
+                  "at DASH_LAT/DASH_LON", flush=True)
+    if not HOME:
+        print("[config] DASH_LAT/DASH_LON/TZ not valid: no home location for the weather", flush=True)
+    threading.Thread(target=data_poll_loop, daemon=True).start()
+    if DASH_GEOIP_URL:
+        threading.Thread(target=geoip_loop, daemon=True).start()
     if CLAUDE_REFRESH_TOKEN or os.path.exists(TOKEN_FILE):
         threading.Thread(target=usage_poll_loop, daemon=True).start()
     if CODEX_REFRESH_TOKEN or os.path.exists(CODEX_TOKEN_FILE):

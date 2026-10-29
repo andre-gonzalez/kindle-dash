@@ -1,8 +1,14 @@
+import contextlib
 import hashlib
+import http.client
+import io
 import json
 import pathlib
 import tempfile
+import threading
+import time
 import unittest
+import zoneinfo
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from unittest import mock
@@ -104,6 +110,328 @@ class ParserContract(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no key list"):
                 app.fetch_openrouter_once()
 
+    def test_open_meteo_fixture(self):
+        sao_paulo = zoneinfo.ZoneInfo("America/Sao_Paulo")
+        now = datetime(2026, 10, 29, 17, 0, tzinfo=sao_paulo)
+        with mock.patch.object(app, "TZINFO", sao_paulo), mock.patch.object(app, "FORECAST_DAYS", 3):
+            result = app.parse_open_meteo(self.fixture_json("open-meteo-forecast.json"), now=now)
+        self.assertEqual(result["weather"], ("rainy", 18.7, 20.9))
+        self.assertEqual(result["forecast"], [
+            ("Thu", "rainy", 20.3, 16.3), ("Fri", "rainy", 25.6, 17.0), ("Sat", "sunny", 21.3, 15.7),
+        ])
+        self.assertEqual([pct for _, pct in result["hourly"]], [24, 30, 43, None])
+        self.assertEqual(result["hourly"][0][0], datetime(2026, 10, 29, tzinfo=sao_paulo))
+        # After today's sunrise: the next sunrise is tomorrow's, the sunset today's.
+        rise, sett = result["sun"]
+        self.assertEqual((rise.day, rise.strftime("%H:%M")), (30, "05:21"))
+        self.assertEqual((sett.day, sett.strftime("%H:%M")), (29, "18:18"))
+        self.assertIsNone(app.parse_open_meteo({}))
+
+    def test_wmo_codes_map_to_ha_conditions(self):
+        cases = {
+            (0, 1): "sunny", (0, 0): "clear-night", (1, 0): "clear-night",
+            (2, 0): "partlycloudy", (3, 1): "cloudy", (48, 1): "fog", (55, 1): "rainy",
+            (65, 1): "pouring", (67, 1): "snowy-rainy", (75, 1): "snowy",
+            (95, 1): "lightning", (99, 1): "lightning-rainy", (1234, 1): None,
+        }
+        for (code, is_day), cond in cases.items():
+            self.assertEqual(app.wmo_condition(code, is_day), cond, code)
+
+    def test_open_meteo_fetch_uses_the_location_and_units(self):
+        with mock.patch.object(app, "requests") as req:
+            self.assertIsNone(app.fetch_open_meteo(None))
+        req.get.assert_not_called()
+        tokyo = {"lat": 35.68, "lon": 139.69, "tz": "Asia/Tokyo", "name": "Tokyo", "source": "manual"}
+        with (
+            mock.patch.object(app, "DASH_UNITS", "imperial"),
+            mock.patch.object(app, "requests") as req,
+        ):
+            req.get.return_value.json.return_value = self.fixture_json("open-meteo-forecast.json")
+            result = app.fetch_open_meteo(tokyo)
+        self.assertEqual(result["weather"][0], "rainy")
+        # Times are in the location's zone, not the home TZ.
+        self.assertEqual(result["hourly"][0][0].tzinfo, zoneinfo.ZoneInfo("Asia/Tokyo"))
+        params = req.get.call_args.kwargs["params"]
+        self.assertEqual((params["latitude"], params["longitude"]), (35.68, 139.69))
+        self.assertEqual((params["timezone"], params["temperature_unit"]), ("Asia/Tokyo", "fahrenheit"))
+
+
+LISBON = {"lat": 38.72, "lon": -9.14, "tz": "Europe/Lisbon", "name": "Lisbon", "source": "geoip"}
+TOKYO = {"lat": 35.68, "lon": 139.69, "tz": "Asia/Tokyo", "name": "Tokyo", "source": "manual"}
+HOME = {"lat": -23.55, "lon": -46.63, "tz": "America/Sao_Paulo", "name": "", "source": "home"}
+
+
+class LocationContract(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = str(pathlib.Path(tmp.name, "location.json"))
+        for name, value in {
+            "LOCATION_FILE": self.path, "HOME": HOME, "GEO_LOCATION": None,
+            "LOCATION": {"override": None, "last": None, "last_saved": None},
+            "KINDLE_IP": None, "_GEOIP_CACHE": {}, "_OWN_IP": (0.0, None),
+        }.items():
+            patcher = mock.patch.object(app, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        app.POLL_WAKE.clear()
+        app.GEOIP_WAKE.clear()
+
+    def test_priority_is_override_geoip_last_home(self):
+        last = {**LISBON, "name": "Porto"}
+        self.assertEqual(app.resolve_location(TOKYO, LISBON, last, HOME), TOKYO)
+        self.assertEqual(app.resolve_location(None, LISBON, last, HOME), LISBON)
+        self.assertEqual(app.resolve_location(None, None, last, HOME), last)
+        self.assertEqual(app.resolve_location(None, None, None, HOME), HOME)
+        self.assertIsNone(app.resolve_location(None, None, None, None))
+        # An override is always "manual".
+        self.assertEqual(app.resolve_location(LISBON, None, None, HOME)["source"], "manual")
+
+    def test_home_comes_from_env(self):
+        self.assertEqual(
+            app.valid_location({"lat": "-23.55", "lon": "-46.63", "tz": "America/Sao_Paulo"}, "home"),
+            HOME,
+        )
+        for bad in ({"lat": "", "lon": "", "tz": "UTC"}, {"lat": 91, "lon": 0, "tz": "UTC"},
+                    {"lat": 1, "lon": 2, "tz": "Not/AZone"}, {}):
+            self.assertIsNone(app.valid_location(bad, "home"), bad)
+
+    def test_override_and_last_survive_a_restart(self):
+        app.update_location(override=TOKYO, last=LISBON)
+        loaded = app.load_location(self.path)
+        self.assertEqual((loaded["override"], loaded["last"]), (TOKYO, LISBON))
+        self.assertAlmostEqual(loaded["last_saved"], time.time(), delta=5)
+        # A damaged or hand-edited file gives no location, not a crash.
+        empty = {"override": None, "last": None, "last_saved": None}
+        pathlib.Path(self.path).write_text('{"override": {"lat": "x"}, "last": 3}')
+        self.assertEqual(app.load_location(self.path), empty)
+        pathlib.Path(self.path).write_text("not json")
+        self.assertEqual(app.load_location(self.path), empty)
+
+    def test_last_location_expires_after_a_day(self):
+        # The ipapi.co terms allow no copy older than 24 h.
+        app.update_location(last=LISBON, last_saved=time.time() - 25 * 3600)
+        self.assertEqual(app.current_location(), HOME)
+        self.assertIsNone(app.load_location(self.path)["last"])
+        app.update_location(last=LISBON, last_saved=time.time() - 23 * 3600)
+        self.assertEqual(app.current_location(), LISBON)
+
+    def test_public_ip_accepts_only_global_addresses(self):
+        for text, ip in {
+            "8.8.8.8": "8.8.8.8", " 8.8.8.8\n": "8.8.8.8",
+            "2001:4860:4860::8888": "2001:4860:4860::8888",
+            "192.168.0.10": None, "10.0.0.1": None, "127.0.0.1": None,
+            "100.64.1.1": None,  # CGNAT, and the Tailscale range
+            "203.0.113.7": None,  # documentation range
+            "8.8.8.8.8": None, "not-an-ip": None, "": None,
+        }.items():
+            self.assertEqual(app.public_ip(text), ip, text)
+
+    def test_geoip_fixture(self):
+        data = json.loads((FIXTURES / "ipapi-geoip.json").read_text())
+        self.assertEqual(app.parse_geoip(data), {
+            "lat": 37.42301, "lon": -122.083352, "tz": "America/Los_Angeles",
+            "name": "Mountain View", "source": "geoip",
+        })
+        reserved = {"ip": "192.168.0.1", "error": True, "reason": "Reserved IP Address"}
+        self.assertIsNone(app.parse_geoip(reserved))
+        self.assertIsNone(app.parse_geoip({"error": True, "reason": "RateLimited"}))
+        self.assertIsNone(app.parse_geoip({"city": "X"}))  # no coordinates
+
+    def test_geoip_lookup_is_cached_for_each_ip(self):
+        answer = mock.Mock()
+        answer.json.return_value = json.loads((FIXTURES / "ipapi-geoip.json").read_text())
+        t = 1_000_000.0
+        with mock.patch.object(app.requests, "get", return_value=answer) as get:
+            loc, fetched = app.geoip_lookup("8.8.8.8", now=t)
+            self.assertEqual((loc["name"], fetched), ("Mountain View", t))
+            self.assertEqual(app.geoip_lookup("8.8.8.8", now=t + 3600), (loc, t))
+            self.assertEqual(get.call_count, 1)
+            self.assertIn("/8.8.8.8/", get.call_args.args[0])
+            # ipapi.co rate-limits the default python-requests User-Agent.
+            self.assertEqual(get.call_args.kwargs["headers"]["User-Agent"], "kindle-dash")
+            app.geoip_lookup("8.8.8.8", now=t + 13 * 3600)  # older than 12 h: again
+            self.assertEqual(get.call_count, 2)
+        # A failed lookup waits 15 minutes before it tries the same IP again.
+        with (
+            mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError("x")) as get,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(app.geoip_lookup("1.1.1.1", now=t), (None, t))
+            app.geoip_lookup("1.1.1.1", now=t + 600)
+            self.assertEqual(get.call_count, 1)
+            app.geoip_lookup("1.1.1.1", now=t + 1000)
+            self.assertEqual(get.call_count, 2)
+
+    def test_the_home_network_gives_the_home_location(self):
+        own = mock.Mock(text="8.8.8.8\n")
+        with (
+            mock.patch.object(app.requests, "get", return_value=own) as get,
+            mock.patch.object(app, "geoip_lookup", return_value=(LISBON, 5.0)) as lookup,
+        ):
+            self.assertEqual(app.locate("8.8.8.8")[0], HOME)
+            lookup.assert_not_called()
+            self.assertEqual(app.locate("1.1.1.1"), (LISBON, 5.0))
+            self.assertEqual(get.call_count, 1)  # the own IP is cached
+
+    def test_geoip_location_sets_the_last_location(self):
+        app.set_geo_location(LISBON, fetched=time.time() - 60)
+        self.assertEqual(app.current_location(), LISBON)
+        self.assertTrue(app.POLL_WAKE.is_set())
+        self.assertEqual(app.load_location(self.path)["last"], LISBON)
+        # A failed lookup (unknown) keeps the last location, not home.
+        app.set_geo_location(None)
+        self.assertEqual(app.current_location(), LISBON)
+        # Home clears the last location.
+        app.set_geo_location(HOME)
+        self.assertEqual(app.current_location(), HOME)
+        app.set_geo_location(None)
+        self.assertEqual(app.current_location(), HOME)
+        # The override still wins over geo-IP.
+        app.update_location(override=TOKYO)
+        app.set_geo_location(LISBON)
+        self.assertEqual(app.current_location(), TOKYO)
+
+    def test_dash_png_records_the_kindle_ip(self):
+        with mock.patch.object(app, "render", return_value=b"png"):
+            self.assertEqual(self.request("GET", "/dash.png?battery=80&ip=8.8.8.8")[0], 200)
+            self.assertEqual(app.KINDLE_IP, "8.8.8.8")
+            self.assertTrue(app.GEOIP_WAKE.is_set())
+            app.GEOIP_WAKE.clear()
+            for query in ("ip=8.8.8.8", "ip=192.168.0.2", "ip=bad", "battery=80", ""):
+                self.request("GET", f"/dash.png?{query}")
+            self.assertEqual(app.KINDLE_IP, "8.8.8.8")  # no new, valid IP: no change
+            self.assertFalse(app.GEOIP_WAKE.is_set())
+            with mock.patch.object(app, "DASH_GEOIP_URL", ""):  # geo-IP off
+                self.request("GET", "/dash.png?ip=1.1.1.1")
+            self.assertEqual(app.KINDLE_IP, "8.8.8.8")
+
+    def test_a_location_change_wakes_the_poll(self):
+        app.update_location(last=None)  # no change
+        self.assertFalse(app.POLL_WAKE.is_set())
+        app.update_location(override=TOKYO)
+        self.assertTrue(app.POLL_WAKE.is_set())
+        self.assertEqual(app.current_location(), TOKYO)
+
+    def test_poll_fetches_the_weather_for_the_current_location(self):
+        app.update_location(override=TOKYO)
+        with (
+            mock.patch.object(app, "fetch_open_meteo", return_value=None) as meteo,
+            mock.patch.object(app, "fetch_events", return_value=None),
+            mock.patch.object(app, "DATA", {}),
+        ):
+            app.poll_once()
+            self.assertEqual(meteo.call_args.args[0], TOKYO)
+            self.assertEqual(app.DATA["location"], TOKYO)
+            self.assertEqual(app.DATA["weather"], (None, None, None))
+
+    def test_time_zone_follows_the_location(self):
+        with mock.patch.object(app, "TZINFO", timezone.utc):
+            self.assertEqual(app.local_tz(), timezone.utc)  # home: TZ
+            app.update_location(override=TOKYO)
+            self.assertEqual(app.local_tz(), zoneinfo.ZoneInfo("Asia/Tokyo"))
+            # The agenda asks for the Tokyo day, from Tokyo midnight.
+            with (
+                mock.patch.object(app, "HA_CALENDAR_ENTITIES", ["calendar.a"]),
+                mock.patch.object(app, "DASH_ICS_URLS", []),
+                mock.patch.object(app, "_ha", return_value=[]) as ha,
+            ):
+                app.fetch_events()
+            start = datetime.fromisoformat(ha.call_args.kwargs["start"])
+            self.assertEqual(start.utcoffset(), timedelta(hours=9))
+            self.assertEqual((start.hour, start.minute), (0, 0))
+
+    def request(self, method, path, body=None):
+        """(status, headers, text) of one request to a real Handler server."""
+        server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        self.addCleanup(conn.close)
+        headers = {"Content-Type": "application/x-www-form-urlencoded"} if body is not None else {}
+        conn.request(method, path, body=body, headers=headers)
+        r = conn.getresponse()
+        return r.status, dict(r.getheaders()), r.read().decode()
+
+    def test_geocoding_fixture(self):
+        data = json.loads((FIXTURES / "open-meteo-geocoding.json").read_text())
+        result = app.parse_geocoding(data)
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result[0], {
+            "lat": 48.85341, "lon": 2.3488, "tz": "Europe/Paris", "name": "Paris",
+            "source": "manual", "region": "Île-de-France Region, France",
+        })
+        self.assertEqual(result[1]["region"], "Texas, United States")
+        self.assertEqual(app.parse_geocoding({"generationtime_ms": 0.2}), [])  # no match
+        with (
+            mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError("x")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertIsNone(app.search_cities("Paris"))
+
+    def test_location_page_shows_the_current_location_and_search_results(self):
+        status, _, page = self.request("GET", "/location")
+        self.assertEqual(status, 200)
+        self.assertIn("Now: home", page)
+        app.update_location(override={**TOKYO, "name": "<b>Tokyo</b>"})
+        found = [{**LISBON, "source": "manual", "name": "<script>x</script>", "region": "Lisbon, Portugal"}]
+        with mock.patch.object(app, "search_cities", return_value=found) as search:
+            _, _, page = self.request("GET", "/location?q=Lisbon")
+        search.assert_called_once_with("Lisbon")
+        self.assertIn("&lt;b&gt;Tokyo&lt;/b&gt; — manual override", page)
+        self.assertIn("&lt;script&gt;x&lt;/script&gt;", page)  # all text is escaped
+        self.assertNotIn("<script>", page)
+        self.assertIn('name="tz" value="Europe/Lisbon"', page)
+        with mock.patch.object(app, "search_cities", return_value=[]):
+            self.assertIn("No match for “Atlantis”", self.request("GET", "/location?q=Atlantis")[2])
+        with mock.patch.object(app, "search_cities", return_value=None):
+            self.assertIn("The search failed", self.request("GET", "/location?q=Lisbon")[2])
+
+    def test_location_page_sets_and_clears_the_override(self):
+        body = "action=set&lat=38.72&lon=-9.14&tz=Europe%2FLisbon&name=Lisbon"
+        status, headers, _ = self.request("POST", "/location", body)
+        self.assertEqual((status, headers["Location"]), (303, "/location"))
+        self.assertEqual(app.current_location(), {**LISBON, "source": "manual"})
+        self.assertTrue(app.POLL_WAKE.is_set())
+        self.assertEqual(app.load_location(self.path)["override"], {**LISBON, "source": "manual"})
+        self.assertEqual(self.request("POST", "/location", "action=auto")[0], 303)
+        self.assertEqual(app.current_location(), HOME)
+        for bad in ("action=set&lat=x&lon=1&tz=UTC&name=A", "action=set&lat=1&lon=1&tz=Bad/Zone&name=A",
+                    "action=set&lat=1&lon=1&tz=UTC", "action=delete", ""):
+            self.assertEqual(self.request("POST", "/location", bad)[0], 400, bad)
+        self.assertEqual(app.current_location(), HOME)
+        self.assertEqual(self.request("POST", "/dash.png", "")[0], 404)
+
+    def test_city_label(self):
+        self.assertEqual(app.location_label(None), "")
+        self.assertEqual(app.location_label(HOME), "")
+        self.assertEqual(app.location_label(LISBON), "Lisbon")
+        self.assertEqual(app.location_label(TOKYO), "Tokyo (manual)")
+        self.assertEqual(app.location_label({**LISBON, "name": ""}), "38.72, -9.14")
+
+    @unittest.skipUnless(
+        pathlib.Path(app.FONT_DIR, "DejaVuSans.ttf").exists(), "needs the DejaVu fonts (DASH_FONT_DIR)"
+    )
+    def test_city_line_shows_only_away_from_home(self):
+        def weather(loc):
+            image = Image.new("L", (480, 150), 255)
+            with mock.patch.dict(app.DATA, {"weather": ("rainy", 17, 15), "location": loc}):
+                app.w_weather(ImageDraw.Draw(image), (0, 0, 480, 150))
+            return image
+
+        # The city line: right of the icon (r = 0.32 h), under the condition.
+        line = (int(150 * 0.32 * 2.5 + 16), int(150 * 0.82), 480, 150)
+        self.assertEqual(weather(HOME).tobytes(), weather(None).tobytes())
+        self.assertIsNone(ImageOps.invert(weather(HOME).crop(line)).getbbox())
+        geoip = ImageOps.invert(weather(LISBON).crop(line)).getbbox()
+        manual = ImageOps.invert(weather({**LISBON, "source": "manual"}).crop(line)).getbbox()
+        self.assertIsNotNone(geoip)
+        self.assertGreater(manual[2], geoip[2])  # " (manual)" makes it longer
+        # The rows above the city line do not change.
+        top = (0, 0, 480, line[1])
+        self.assertEqual(weather(LISBON).crop(top).tobytes(), weather(HOME).crop(top).tobytes())
+
 
 class RenderContract(unittest.TestCase):
     def test_claude_rows_omit_extra_spend(self):
@@ -193,7 +521,7 @@ class RenderContract(unittest.TestCase):
                 mock.patch.object(app, "KINDLE_W", 1024),
                 mock.patch.object(app, "KINDLE_H", 758),
                 mock.patch.object(app, "DASH_WIDGETS", widgets),
-                mock.patch.dict(app.HA_DATA, {"weather": ("sunny", temp, temp)}),
+                mock.patch.dict(app.DATA, {"weather": ("sunny", temp, temp)}),
             ):
                 return Image.open(BytesIO(app.render(rotate=0, battery=(100, True))))
 
@@ -222,19 +550,6 @@ class RenderContract(unittest.TestCase):
         # Bar starts at x=99 with a 3px outline. A non-zero value must fill
         # at least the first interior pixel instead of disappearing under it.
         self.assertEqual(image.getpixel((102, 70)), 0)
-
-    def test_hourly_forecast_parses_rain_probability(self):
-        resp = {"service_response": {"weather.home": {"forecast": [
-            {"datetime": "2026-07-19T18:00:00+00:00", "precipitation_probability": 40},
-            {"datetime": "2026-07-19T19:00:00+00:00", "precipitation_probability": 72.6},
-            {"datetime": "2026-07-19T20:00:00+00:00"},
-            {"precipitation_probability": 10},
-        ]}}}
-        result = app.parse_hourly(resp, "weather.home")
-        self.assertEqual([pct for _, pct in result], [40, 73, None])
-        self.assertEqual(result[0][0], NOW)
-        self.assertIsNone(app.parse_hourly(None, "weather.home"))
-        self.assertIsNone(app.parse_hourly(resp, "weather.other"))
 
     def test_agenda_merges_calendars(self):
         start = datetime(2026, 7, 19, tzinfo=app.TZINFO)
@@ -270,6 +585,63 @@ class RenderContract(unittest.TestCase):
             start + timedelta(hours=11),
             start + timedelta(hours=15),
         ])
+
+    def test_ics_fixture(self):
+        sao_paulo = zoneinfo.ZoneInfo("America/Sao_Paulo")
+        start = datetime(2026, 10, 29, tzinfo=sao_paulo)
+        with mock.patch.object(app, "TZINFO", sao_paulo):
+            events = app.parse_ics((FIXTURES / "calendar.ics").read_bytes().decode(), start)
+            result = app.parse_events([events], start)
+        # A weekly repeat, a moved repeat instance, an all-day event, an
+        # overnight event, and a UTC event. Not shown: a cancelled event, an
+        # EXDATE instance (yesterday), and tomorrow's event.
+        self.assertEqual([(lbl, s) for _, lbl, s in result], [
+            ("all day", "Holiday"),
+            ("→06:15", "Flight"),
+            ("09:30", "Standup"),
+            ("12:00", "Call"),
+            ("16:00", "Review (moved)"),
+        ])
+
+    def test_agenda_merges_ics_and_ha_calendars(self):
+        sao_paulo = zoneinfo.ZoneInfo("America/Sao_Paulo")
+        now = datetime(2026, 10, 29, 8, 0, tzinfo=sao_paulo)
+        ha = [
+            # The same invite as the ICS Standup shows once.
+            {"start": {"dateTime": "2026-10-29T09:30:00-03:00"}, "summary": "Standup"},
+            {"start": {"dateTime": "2026-10-29T18:00:00-03:00"}, "summary": "Gym"},
+        ]
+        feed = mock.Mock(text=(FIXTURES / "calendar.ics").read_bytes().decode())
+        missing = mock.Mock()
+        missing.raise_for_status.side_effect = app.requests.HTTPError(
+            "404 Client Error: Not Found for url: https://secret.example/b.ics",
+            response=mock.Mock(status_code=404),
+        )
+        log = io.StringIO()
+        with (
+            mock.patch.object(app, "TZINFO", sao_paulo),
+            mock.patch.object(app, "HA_CALENDAR_ENTITIES", ["calendar.work"]),
+            mock.patch.object(app, "DASH_ICS_URLS", ["https://secret.example/a.ics",
+                                                     "https://secret.example/b.ics"]),
+            mock.patch.object(app, "_ha", return_value=ha),
+            mock.patch.object(app.requests, "get", side_effect=[feed, missing]),
+            contextlib.redirect_stdout(log),
+        ):
+            result = app.fetch_events(now)
+        self.assertEqual([s for _, _, s in result], [
+            "Holiday", "Flight", "Standup", "Call", "Review (moved)", "Gym",
+        ])
+        # A failed feed is named by its number: its URL is a secret.
+        self.assertIn("[ics] calendar 2 failed: HTTP 404", log.getvalue())
+        self.assertNotIn("secret", log.getvalue())
+        # Every feed failed: no calendar, not "nothing scheduled".
+        with (
+            mock.patch.object(app, "HA_CALENDAR_ENTITIES", []),
+            mock.patch.object(app, "DASH_ICS_URLS", ["https://secret.example/a.ics"]),
+            mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError("x")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertIsNone(app.fetch_events())
 
     def test_agenda_hides_events_past_the_grace_period(self):
         start = datetime(2026, 7, 19, tzinfo=app.TZINFO)
@@ -315,42 +687,12 @@ class RenderContract(unittest.TestCase):
         ):
             self.assertIsNone(app.fetch_events())
 
-    def test_open_meteo_parses_rain_probability(self):
-        data = {"hourly": {
-            "time": [int(NOW.timestamp()), int(NOW.timestamp()) + 3600],
-            "precipitation_probability": [41, None],
-        }}
-        result = app.parse_open_meteo(data)
-        self.assertEqual([pct for _, pct in result], [41, None])
-        self.assertEqual(result[0][0], NOW)
-        self.assertIsNone(app.parse_open_meteo({}))
-
-    def test_hourly_falls_back_to_open_meteo_without_probability(self):
-        # Met.no-style hourly forecast: rain amount, no probability.
-        ha_hourly = {"service_response": {"weather.home": {"forecast": [
-            {"datetime": "2026-07-19T18:00:00+00:00", "precipitation": 0.4},
-        ]}}}
-        meteo = [(NOW, 55)]
-
-        def fake_ha(method, path, body=None, **params):
-            return ha_hourly if path.endswith("get_forecasts") else {"latitude": 1, "longitude": 2}
-
-        with (
-            mock.patch.object(app, "HA_WEATHER_ENTITY", "weather.home"),
-            mock.patch.object(app, "_ha", side_effect=fake_ha),
-            mock.patch.object(app, "requests") as req,
-            mock.patch.object(app, "parse_open_meteo", return_value=meteo),
-        ):
-            self.assertEqual(app.fetch_hourly(), meteo)
-        params = req.get.call_args.kwargs["params"]
-        self.assertEqual((params["latitude"], params["longitude"]), (1, 2))
-
     def test_rain_chart_skips_past_hours(self):
         now = datetime.now(app.TZINFO).replace(minute=0, second=0, microsecond=0)
         past = [(now - timedelta(hours=2), 100), (now - timedelta(hours=1), 100)]
         image = Image.new("L", (400, 120), 255)
         draw = ImageDraw.Draw(image)
-        with mock.patch.dict(app.HA_DATA, {"hourly": past + [(now, 0)]}):
+        with mock.patch.dict(app.DATA, {"hourly": past + [(now, 0)]}):
             app.w_rain(draw, (0, 0, 400, 120))
         # The first column is the current 0% hour, not a past 100% one: the
         # inside of its bar stays white.

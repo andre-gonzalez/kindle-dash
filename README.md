@@ -19,6 +19,7 @@ No glowing rectangle, no app, no cloud account. A tiny container renders a grays
 - **Rain** — chance of rain for each of the next N hours, as a bar chart.
 - **Sun** — sunrise/sunset.
 - **Battery** — the Kindle's own charge, small in the top-right corner (the device reports it on each fetch).
+- **Travel** — away from home, the weather, the forecast, and the clock follow the Kindle: geo-IP of its network, or a city that you set on the `/location` page. The city shows under the weather.
 - **AI usage** — live subscription limits side by side: Claude (5h/7d/Extra), Codex (available windows/Credits), opencode Go (5h/Week/Month), OpenRouter (this month's USD spend). Columns size themselves to however many you enable.
 
 Every panel is optional. A panel with no data source configured just renders a quiet placeholder — never a broken image.
@@ -33,9 +34,11 @@ A 6-inch e-ink screen is the *perfect* ambient display: paper-like, sunlight-rea
   ┌──────────── any always-on host the Kindle can reach (LAN) ───────────┐
   │  kindle-dash renderer (container, Python + Pillow)                   │
   │    • lays out a grid of WIDGETS, draws a grayscale PNG               │
-  │    • pulls: Home Assistant (weather/forecast/sun/agenda)             │
+  │    • pulls: Open-Meteo (weather/forecast/rain/sun, no key)           │
+  │            ICS / Home Assistant calendars (agenda)                   │
   │            Claude/Codex/OpenRouter usage API + opencode scrape       │
   │    • serves GET /dash.png  (plain HTTP — the Kindle can't do TLS)    │
+  │      and GET /location (set the city by hand while you travel)       │
   └───────────────────────────────┬──────────────────────────────────────┘
                                    │  http (LAN)
                 ┌──────────────────▼───────────────────┐
