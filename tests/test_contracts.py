@@ -1,8 +1,11 @@
+import contextlib
 import hashlib
+import io
 import json
 import pathlib
 import tempfile
 import unittest
+import zoneinfo
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from unittest import mock
@@ -104,6 +107,52 @@ class ParserContract(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "no key list"):
                 app.fetch_openrouter_once()
 
+    def test_open_meteo_fixture(self):
+        sao_paulo = zoneinfo.ZoneInfo("America/Sao_Paulo")
+        now = datetime(2026, 10, 29, 17, 0, tzinfo=sao_paulo)
+        with mock.patch.object(app, "TZINFO", sao_paulo), mock.patch.object(app, "FORECAST_DAYS", 3):
+            result = app.parse_open_meteo(self.fixture_json("open-meteo-forecast.json"), now=now)
+        self.assertEqual(result["weather"], ("rainy", 18.7, 20.9))
+        self.assertEqual(result["forecast"], [
+            ("Thu", "rainy", 20.3, 16.3), ("Fri", "rainy", 25.6, 17.0), ("Sat", "sunny", 21.3, 15.7),
+        ])
+        self.assertEqual([pct for _, pct in result["hourly"]], [24, 30, 43, None])
+        self.assertEqual(result["hourly"][0][0], datetime(2026, 10, 29, tzinfo=sao_paulo))
+        # After today's sunrise: the next sunrise is tomorrow's, the sunset today's.
+        rise, sett = result["sun"]
+        self.assertEqual((rise.day, rise.strftime("%H:%M")), (30, "05:21"))
+        self.assertEqual((sett.day, sett.strftime("%H:%M")), (29, "18:18"))
+        self.assertIsNone(app.parse_open_meteo({}))
+
+    def test_wmo_codes_map_to_ha_conditions(self):
+        cases = {
+            (0, 1): "sunny", (0, 0): "clear-night", (1, 0): "clear-night",
+            (2, 0): "partlycloudy", (3, 1): "cloudy", (48, 1): "fog", (55, 1): "rainy",
+            (65, 1): "pouring", (67, 1): "snowy-rainy", (75, 1): "snowy",
+            (95, 1): "lightning", (99, 1): "lightning-rainy", (1234, 1): None,
+        }
+        for (code, is_day), cond in cases.items():
+            self.assertEqual(app.wmo_condition(code, is_day), cond, code)
+
+    def test_open_meteo_fetch_uses_the_home_location_and_units(self):
+        with (
+            mock.patch.object(app, "DASH_LAT", ""),
+            mock.patch.object(app, "requests") as req,
+        ):
+            self.assertIsNone(app.fetch_open_meteo())
+        req.get.assert_not_called()
+        with (
+            mock.patch.object(app, "DASH_LAT", "-23.55"),
+            mock.patch.object(app, "DASH_LON", "-46.63"),
+            mock.patch.object(app, "DASH_UNITS", "imperial"),
+            mock.patch.object(app, "requests") as req,
+        ):
+            req.get.return_value.json.return_value = self.fixture_json("open-meteo-forecast.json")
+            self.assertEqual(app.fetch_open_meteo()["weather"][0], "rainy")
+        params = req.get.call_args.kwargs["params"]
+        self.assertEqual((params["latitude"], params["longitude"]), ("-23.55", "-46.63"))
+        self.assertEqual(params["temperature_unit"], "fahrenheit")
+
 
 class RenderContract(unittest.TestCase):
     def test_claude_rows_omit_extra_spend(self):
@@ -193,7 +242,7 @@ class RenderContract(unittest.TestCase):
                 mock.patch.object(app, "KINDLE_W", 1024),
                 mock.patch.object(app, "KINDLE_H", 758),
                 mock.patch.object(app, "DASH_WIDGETS", widgets),
-                mock.patch.dict(app.HA_DATA, {"weather": ("sunny", temp, temp)}),
+                mock.patch.dict(app.DATA, {"weather": ("sunny", temp, temp)}),
             ):
                 return Image.open(BytesIO(app.render(rotate=0, battery=(100, True))))
 
@@ -222,19 +271,6 @@ class RenderContract(unittest.TestCase):
         # Bar starts at x=99 with a 3px outline. A non-zero value must fill
         # at least the first interior pixel instead of disappearing under it.
         self.assertEqual(image.getpixel((102, 70)), 0)
-
-    def test_hourly_forecast_parses_rain_probability(self):
-        resp = {"service_response": {"weather.home": {"forecast": [
-            {"datetime": "2026-07-19T18:00:00+00:00", "precipitation_probability": 40},
-            {"datetime": "2026-07-19T19:00:00+00:00", "precipitation_probability": 72.6},
-            {"datetime": "2026-07-19T20:00:00+00:00"},
-            {"precipitation_probability": 10},
-        ]}}}
-        result = app.parse_hourly(resp, "weather.home")
-        self.assertEqual([pct for _, pct in result], [40, 73, None])
-        self.assertEqual(result[0][0], NOW)
-        self.assertIsNone(app.parse_hourly(None, "weather.home"))
-        self.assertIsNone(app.parse_hourly(resp, "weather.other"))
 
     def test_agenda_merges_calendars(self):
         start = datetime(2026, 7, 19, tzinfo=app.TZINFO)
@@ -270,6 +306,63 @@ class RenderContract(unittest.TestCase):
             start + timedelta(hours=11),
             start + timedelta(hours=15),
         ])
+
+    def test_ics_fixture(self):
+        sao_paulo = zoneinfo.ZoneInfo("America/Sao_Paulo")
+        start = datetime(2026, 10, 29, tzinfo=sao_paulo)
+        with mock.patch.object(app, "TZINFO", sao_paulo):
+            events = app.parse_ics((FIXTURES / "calendar.ics").read_bytes().decode(), start)
+            result = app.parse_events([events], start)
+        # A weekly repeat, a moved repeat instance, an all-day event, an
+        # overnight event, and a UTC event. Not shown: a cancelled event, an
+        # EXDATE instance (yesterday), and tomorrow's event.
+        self.assertEqual([(lbl, s) for _, lbl, s in result], [
+            ("all day", "Holiday"),
+            ("→06:15", "Flight"),
+            ("09:30", "Standup"),
+            ("12:00", "Call"),
+            ("16:00", "Review (moved)"),
+        ])
+
+    def test_agenda_merges_ics_and_ha_calendars(self):
+        sao_paulo = zoneinfo.ZoneInfo("America/Sao_Paulo")
+        now = datetime(2026, 10, 29, 8, 0, tzinfo=sao_paulo)
+        ha = [
+            # The same invite as the ICS Standup shows once.
+            {"start": {"dateTime": "2026-10-29T09:30:00-03:00"}, "summary": "Standup"},
+            {"start": {"dateTime": "2026-10-29T18:00:00-03:00"}, "summary": "Gym"},
+        ]
+        feed = mock.Mock(text=(FIXTURES / "calendar.ics").read_bytes().decode())
+        missing = mock.Mock()
+        missing.raise_for_status.side_effect = app.requests.HTTPError(
+            "404 Client Error: Not Found for url: https://secret.example/b.ics",
+            response=mock.Mock(status_code=404),
+        )
+        log = io.StringIO()
+        with (
+            mock.patch.object(app, "TZINFO", sao_paulo),
+            mock.patch.object(app, "HA_CALENDAR_ENTITIES", ["calendar.work"]),
+            mock.patch.object(app, "DASH_ICS_URLS", ["https://secret.example/a.ics",
+                                                     "https://secret.example/b.ics"]),
+            mock.patch.object(app, "_ha", return_value=ha),
+            mock.patch.object(app.requests, "get", side_effect=[feed, missing]),
+            contextlib.redirect_stdout(log),
+        ):
+            result = app.fetch_events(now)
+        self.assertEqual([s for _, _, s in result], [
+            "Holiday", "Flight", "Standup", "Call", "Review (moved)", "Gym",
+        ])
+        # A failed feed is named by its number: its URL is a secret.
+        self.assertIn("[ics] calendar 2 failed: HTTP 404", log.getvalue())
+        self.assertNotIn("secret", log.getvalue())
+        # Every feed failed: no calendar, not "nothing scheduled".
+        with (
+            mock.patch.object(app, "HA_CALENDAR_ENTITIES", []),
+            mock.patch.object(app, "DASH_ICS_URLS", ["https://secret.example/a.ics"]),
+            mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError("x")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertIsNone(app.fetch_events())
 
     def test_agenda_hides_events_past_the_grace_period(self):
         start = datetime(2026, 7, 19, tzinfo=app.TZINFO)
@@ -315,42 +408,12 @@ class RenderContract(unittest.TestCase):
         ):
             self.assertIsNone(app.fetch_events())
 
-    def test_open_meteo_parses_rain_probability(self):
-        data = {"hourly": {
-            "time": [int(NOW.timestamp()), int(NOW.timestamp()) + 3600],
-            "precipitation_probability": [41, None],
-        }}
-        result = app.parse_open_meteo(data)
-        self.assertEqual([pct for _, pct in result], [41, None])
-        self.assertEqual(result[0][0], NOW)
-        self.assertIsNone(app.parse_open_meteo({}))
-
-    def test_hourly_falls_back_to_open_meteo_without_probability(self):
-        # Met.no-style hourly forecast: rain amount, no probability.
-        ha_hourly = {"service_response": {"weather.home": {"forecast": [
-            {"datetime": "2026-07-19T18:00:00+00:00", "precipitation": 0.4},
-        ]}}}
-        meteo = [(NOW, 55)]
-
-        def fake_ha(method, path, body=None, **params):
-            return ha_hourly if path.endswith("get_forecasts") else {"latitude": 1, "longitude": 2}
-
-        with (
-            mock.patch.object(app, "HA_WEATHER_ENTITY", "weather.home"),
-            mock.patch.object(app, "_ha", side_effect=fake_ha),
-            mock.patch.object(app, "requests") as req,
-            mock.patch.object(app, "parse_open_meteo", return_value=meteo),
-        ):
-            self.assertEqual(app.fetch_hourly(), meteo)
-        params = req.get.call_args.kwargs["params"]
-        self.assertEqual((params["latitude"], params["longitude"]), (1, 2))
-
     def test_rain_chart_skips_past_hours(self):
         now = datetime.now(app.TZINFO).replace(minute=0, second=0, microsecond=0)
         past = [(now - timedelta(hours=2), 100), (now - timedelta(hours=1), 100)]
         image = Image.new("L", (400, 120), 255)
         draw = ImageDraw.Draw(image)
-        with mock.patch.dict(app.HA_DATA, {"hourly": past + [(now, 0)]}):
+        with mock.patch.dict(app.DATA, {"hourly": past + [(now, 0)]}):
             app.w_rain(draw, (0, 0, 400, 120))
         # The first column is the current 0% hour, not a past 100% one: the
         # inside of its bar stays white.

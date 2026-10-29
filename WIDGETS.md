@@ -11,7 +11,7 @@ Everything scales off the box height, so a widget works at any resolution and in
 
 ```python
 def fetch_aqi():
-    data = _ha_get("/api/states/sensor.air_quality")  # or any source; return None on failure
+    data = _ha("GET", "/api/states/sensor.air_quality")  # or any source; return None on failure
     return data and data.get("state")
 
 def w_aqi(d, box):
@@ -35,30 +35,17 @@ Per-request data from the device goes in the `/dash.png` query string instead of
 
 `DASH_WIDGETS` (env) lists which panels render, in order — drop any to hide it, e.g. `DASH_WIDGETS=clock,weather,usage`. No code change. Each name maps to a fixed box in `render()`.
 
-## Data sources — Home Assistant is *one* of them, not the only one
+## Data sources
 
-The data widgets (weather, forecast, sun, agenda) currently fetch from **Home Assistant** via the `_ha()` helper — that's the shipped integration, not a requirement of the design. The data layer is just a `fetch_*()` returning a fixed shape; the `w_*()` that draws it doesn't care where the data came from. (The Claude-usage widget already proves this — it's a direct API integration, no HA.)
+The data layer is just a `fetch_*()` returning a fixed shape; the `w_*()` that draws it doesn't care where the data came from. Weather, forecast, rain, and sun come from **[Open-Meteo](https://open-meteo.com)** (free, keyless): one GET at `DASH_LAT`/`DASH_LON` returns all four, and `parse_open_meteo()` splits it. The agenda reads **ICS calendar URLs** (`icalendar` + `recurring-ical-events`) and **Home Assistant** calendars via the `_ha()` helper. The usage widgets call their own APIs.
 
-To add another integration, write a fetch variant for your source and dispatch on an env var, keeping HA as one branch:
+To add another integration, write a fetch for your source and return the same shape. The ICS feeds show the pattern: `parse_ics()` turns each feed into the HA calendar event format, so `parse_events()` merges ICS and HA calendars with no source-specific code.
 
-```python
-WEATHER_PROVIDER = os.environ.get("WEATHER_PROVIDER", "ha")
-
-def fetch_weather():
-    if WEATHER_PROVIDER == "open-meteo":
-        return _weather_open_meteo()   # lat/lon, no API key
-    return _weather_ha()               # the shipped default
-```
-
-Good HA-free candidates:
-- **Weather + forecast + sun → [Open-Meteo](https://open-meteo.com)** — free, keyless; one GET returns current, daily hi/lo, and sunrise/sunset. Covers three widgets with just a lat/lon.
-- **Agenda → an `.ics` URL** — Google/Outlook/Apple all publish one. Recurring events need an ICS library (`icalendar` + recurrence expansion).
-
-Return shapes to match: weather `(condition, temp, feels)` · forecast `[(label, condition, hi, lo), …]` · sun `(sunrise_dt, sunset_dt)` · agenda `[(shown_dt_or_None, time_label, summary), …]` (all of today's events; `w_agenda` hides the past ones and caps the rows). Return `None` on any failure.
+Return shapes to match: weather `(condition, temp, feels)` · forecast `[(label, condition, hi, lo), …]` · rain `[(local_dt, pct_or_None), …]` · sun `(sunrise_dt, sunset_dt)` · agenda `[(shown_dt_or_None, time_label, summary), …]` (all of today's events; `w_agenda` hides the past ones and caps the rows). Conditions use the Home Assistant names (`sunny`, `clear-night`, `partlycloudy`, `rainy`, …); `wmo_condition()` maps Open-Meteo's WMO codes to them. Return `None` on any failure.
 
 ## Shipped
 
-Clock · Weather (now) · Forecast (N-day) · Rain (HA hourly forecast, chance per hour) · Agenda (one or more HA calendars) · Sun (HA sunrise/sunset) · Kindle battery (sent by the device) · Claude usage (5h/7d/Extra) · Codex usage (available windows/Credits) · opencode Go usage (5h/Week/Month) · OpenRouter spend (Month USD).
+Clock · Weather (now) · Forecast (N-day) · Rain (Open-Meteo, chance per hour) · Agenda (ICS and HA calendars) · Sun (Open-Meteo sunrise/sunset) · Kindle battery (sent by the device) · Claude usage (5h/7d/Extra) · Codex usage (available windows/Credits) · opencode Go usage (5h/Week/Month) · OpenRouter spend (Month USD).
 
 The four usage providers (`usage`=Claude, `codex`, `opencode`, `openrouter`) share one `_usage_block` renderer and split the bottom strip into a column each. Claude and Codex read OAuth usage APIs (refresh-token seeded); OpenRouter sums `usage_monthly` over all keys with a management key; **opencode has no usage API, so its widget scrapes the Go dashboard HTML** with a browser cookie — see CONFIGURATION.md for the fragility caveat.
 
