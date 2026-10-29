@@ -10,6 +10,10 @@ Endpoints:
                               framebuffer when the device is mounted sideways.
      [&battery=82&charging=1] The device's battery, for the battery widget
                               (dashboard.sh sends it on every fetch).
+  GET /location               Page to set the location by hand (a city search)
+                              or go back to the automatic location.
+  POST /location              The page's forms: action=set (lat, lon, tz,
+                              name) or action=auto.
   GET /healthz                Liveness probe.
 
 Layout is slot-based: render() lays out a grid of boxes and hands each to a
@@ -71,6 +75,8 @@ HA_CALENDAR_ENTITIES = [
 # address in iCal format". They merge into the agenda with the HA calendars.
 # Each URL is a secret (it gives read access to the calendar): never log it.
 DASH_ICS_URLS = [u.strip() for u in os.environ.get("DASH_ICS_URLS", "").split(",") if u.strip()]
+# City search on the /location page (Open-Meteo geocoding, free, no key).
+GEOCODING_URL = os.environ.get("GEOCODING_URL", "https://geocoding-api.open-meteo.com/v1/search")
 # Weather, forecast, rain chance, and sunrise/sunset come from Open-Meteo (free,
 # no key) at DASH_LAT/DASH_LON. RAIN_LAT/RAIN_LON are the old names (they set
 # the location of the old rain fallback). Units stay fixed: metric or imperial.
@@ -1260,11 +1266,111 @@ def render(rotate=None, battery=None):
     return buf.getvalue()
 
 
+# --- /location page: set the location by hand (no auth, see SECURITY.md) ---
+def parse_geocoding(data):
+    """Up to 5 matches [{"lat", "lon", "tz", "name", "region"}] from an
+    Open-Meteo geocoding response; [] for no match. A match with no valid
+    time zone is left out."""
+    out = []
+    for r in (data or {}).get("results") or []:
+        loc = valid_location({"lat": r.get("latitude"), "lon": r.get("longitude"),
+                              "tz": r.get("timezone"), "name": r.get("name")}, "manual")
+        if loc and loc["name"]:
+            region = ", ".join(str(p) for p in (r.get("admin1"), r.get("country")) if p)
+            out.append({**loc, "region": region})
+    return out[:5]
+
+
+def search_cities(q):
+    """City matches for q (see parse_geocoding), or None if the search failed."""
+    try:
+        r = requests.get(GEOCODING_URL, params={"name": q, "count": 5, "format": "json"}, timeout=8)
+        r.raise_for_status()
+        return parse_geocoding(r.json())
+    except Exception as e:
+        print(f"[geocoding] search failed: {e}", flush=True)
+        return None
+
+
+def location_page(loc, q="", results=None):
+    """The /location HTML: the current location, a city search, and the
+    search results (None = the search failed). Plain HTML, no JavaScript."""
+    e = html.escape
+    if not loc:
+        now = "no location (set DASH_LAT/DASH_LON, or search below)"
+    elif loc["source"] == "home":
+        now = "home"
+    else:
+        how = {"manual": "manual override", "geoip": "from the Kindle's IP"}.get(loc["source"], "")
+        now = f"{e(loc['name'] or 'unnamed place')} — {how}"
+    if loc:
+        now += f"<br><small>{loc['lat']:.4f}, {loc['lon']:.4f} · {e(loc['tz'])}</small>"
+    rows = ""
+    if q and results is None:
+        rows = "<p>The search failed. Try again.</p>"
+    elif q and not results:
+        rows = f"<p>No match for “{e(q)}”.</p>"
+    for r in results or []:
+        rows += (
+            '<form method="post" action="/location"><input type="hidden" name="action" value="set">'
+            + "".join(f'<input type="hidden" name="{k}" value="{e(str(r[k]))}">'
+                      for k in ("lat", "lon", "tz", "name"))
+            + f'<button>{e(r["name"])}<br><small>{e(r["region"])} · {e(r["tz"])}</small></button></form>'
+        )
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kindle-dash location</title>
+<style>body{{font-family:sans-serif;max-width:32em;margin:1em auto;padding:0 1em}}
+input,button{{font-size:1em;padding:.5em}}form{{margin:.5em 0}}
+button{{width:100%;text-align:left}}small{{color:#555}}</style></head>
+<body><h1>Location</h1>
+<p>Now: {now}</p>
+<form method="post" action="/location"><input type="hidden" name="action" value="auto">
+<button>Automatic location<br><small>clear the manual override</small></button></form>
+<h2>Set a city</h2>
+<form method="get" action="/location"><input name="q" value="{e(q)}" placeholder="City" required>
+<input type="submit" value="Search"></form>
+{rows}
+</body></html>
+"""
+
+
+def location_post(form):
+    """Apply a /location form ({name: [value]}): set or clear the override.
+    Returns True, or False for a bad form."""
+    action = form.get("action", [""])[0]
+    if action == "auto":
+        update_location(override=None)
+        return True
+    if action == "set":
+        loc = valid_location({k: form.get(k, [""])[0] for k in ("lat", "lon", "tz", "name")}, "manual")
+        if loc and loc["name"]:
+            update_location(override=loc)
+            return True
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def _send(self, code, body=b"", ctype="text/html; charset=utf-8", headers=()):
+        self.send_response(code)
+        for k, v in headers:
+            self.send_header(k, v)
+        if body:
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
+        url = urlparse(self.path)
+        if url.path == "/location":
+            q = parse_qs(url.query).get("q", [""])[0].strip()[:100]
+            results = search_cities(q) if q else []
+            self._send(200, location_page(current_location(), q, results).encode())
+            return
         if self.path == "/healthz":
             self.send_response(200)
             self.end_headers()
@@ -1292,6 +1398,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(404)
         self.end_headers()
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/location":
+            self._send(404)
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if not 0 <= n <= 4096:
+            self._send(400, b"bad request", "text/plain")
+            return
+        form = parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+        if not location_post(form):
+            self._send(400, b"bad request", "text/plain")
+            return
+        # Post/redirect/get: a reload does not post again.
+        self._send(303, headers=[("Location", "/location")])
 
 
 if __name__ == "__main__":

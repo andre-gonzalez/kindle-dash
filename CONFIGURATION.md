@@ -44,7 +44,7 @@ The weather, the time zone, and a small city line under the weather follow the *
 
 Away from home, the clock, the agenda day, the sun times, the rain hours, and the usage reset times use the location's time zone. The city line shows the location name, with `(manual)` for an override. At home there is no city line, so the home dashboard looks the same as before.
 
-The override and the last known location persist in `location.json` in the state dir (`/data`), so a restart keeps them.
+Set or clear the override on the [`/location` page](USAGE.md#set-the-location-by-hand-travel). Its city search uses the [Open-Meteo geocoding API](https://open-meteo.com/en/docs/geocoding-api) (free, no key; `GEOCODING_URL` overrides the endpoint). The override and the last known location persist in `location.json` in the state dir (`/data`), so a restart keeps them.
 
 ## Agenda (ICS calendars · Home Assistant)
 

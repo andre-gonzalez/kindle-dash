@@ -1,9 +1,11 @@
 import contextlib
 import hashlib
+import http.client
 import io
 import json
 import pathlib
 import tempfile
+import threading
 import unittest
 import zoneinfo
 from datetime import datetime, timedelta, timezone
@@ -234,6 +236,68 @@ class LocationContract(unittest.TestCase):
             start = datetime.fromisoformat(ha.call_args.kwargs["start"])
             self.assertEqual(start.utcoffset(), timedelta(hours=9))
             self.assertEqual((start.hour, start.minute), (0, 0))
+
+    def request(self, method, path, body=None):
+        """(status, headers, text) of one request to a real Handler server."""
+        server = app.ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        threading.Thread(target=server.serve_forever, args=(0.01,), daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=5)
+        self.addCleanup(conn.close)
+        headers = {"Content-Type": "application/x-www-form-urlencoded"} if body is not None else {}
+        conn.request(method, path, body=body, headers=headers)
+        r = conn.getresponse()
+        return r.status, dict(r.getheaders()), r.read().decode()
+
+    def test_geocoding_fixture(self):
+        data = json.loads((FIXTURES / "open-meteo-geocoding.json").read_text())
+        result = app.parse_geocoding(data)
+        self.assertEqual(len(result), 5)
+        self.assertEqual(result[0], {
+            "lat": 48.85341, "lon": 2.3488, "tz": "Europe/Paris", "name": "Paris",
+            "source": "manual", "region": "Île-de-France Region, France",
+        })
+        self.assertEqual(result[1]["region"], "Texas, United States")
+        self.assertEqual(app.parse_geocoding({"generationtime_ms": 0.2}), [])  # no match
+        with (
+            mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError("x")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertIsNone(app.search_cities("Paris"))
+
+    def test_location_page_shows_the_current_location_and_search_results(self):
+        status, _, page = self.request("GET", "/location")
+        self.assertEqual(status, 200)
+        self.assertIn("Now: home", page)
+        app.update_location(override={**TOKYO, "name": "<b>Tokyo</b>"})
+        found = [{**LISBON, "source": "manual", "name": "<script>x</script>", "region": "Lisbon, Portugal"}]
+        with mock.patch.object(app, "search_cities", return_value=found) as search:
+            _, _, page = self.request("GET", "/location?q=Lisbon")
+        search.assert_called_once_with("Lisbon")
+        self.assertIn("&lt;b&gt;Tokyo&lt;/b&gt; — manual override", page)
+        self.assertIn("&lt;script&gt;x&lt;/script&gt;", page)  # all text is escaped
+        self.assertNotIn("<script>", page)
+        self.assertIn('name="tz" value="Europe/Lisbon"', page)
+        with mock.patch.object(app, "search_cities", return_value=[]):
+            self.assertIn("No match for “Atlantis”", self.request("GET", "/location?q=Atlantis")[2])
+        with mock.patch.object(app, "search_cities", return_value=None):
+            self.assertIn("The search failed", self.request("GET", "/location?q=Lisbon")[2])
+
+    def test_location_page_sets_and_clears_the_override(self):
+        body = "action=set&lat=38.72&lon=-9.14&tz=Europe%2FLisbon&name=Lisbon"
+        status, headers, _ = self.request("POST", "/location", body)
+        self.assertEqual((status, headers["Location"]), (303, "/location"))
+        self.assertEqual(app.current_location(), {**LISBON, "source": "manual"})
+        self.assertTrue(app.POLL_WAKE.is_set())
+        self.assertEqual(app.load_location(self.path)["override"], {**LISBON, "source": "manual"})
+        self.assertEqual(self.request("POST", "/location", "action=auto")[0], 303)
+        self.assertEqual(app.current_location(), HOME)
+        for bad in ("action=set&lat=x&lon=1&tz=UTC&name=A", "action=set&lat=1&lon=1&tz=Bad/Zone&name=A",
+                    "action=set&lat=1&lon=1&tz=UTC", "action=delete", ""):
+            self.assertEqual(self.request("POST", "/location", bad)[0], 400, bad)
+        self.assertEqual(app.current_location(), HOME)
+        self.assertEqual(self.request("POST", "/dash.png", "")[0], 404)
 
     def test_city_label(self):
         self.assertEqual(app.location_label(None), "")
