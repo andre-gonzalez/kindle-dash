@@ -52,6 +52,10 @@ The OpenRouter panel uses the documented `GET https://openrouter.ai/api/v1/keys`
 
 Opt-in: leave `OPENROUTER_MANAGEMENT_KEY` blank and none of it runs.
 
+## ICS calendar URLs are secrets
+
+A private ICS URL (for example Google's "secret address in iCal format") gives read access to the full calendar to anyone who has it. Treat each `DASH_ICS_URLS` entry as a credential: keep it in `renderer/.env` or your secret store, not in a committed compose file. The renderer never logs the URLs; a failed feed is logged by its number (`[ics] calendar 2 failed: HTTP 404`). If a URL leaks, reset it in the calendar settings (Google: "Reset" next to the secret address).
+
 ## Token handling
 
 - The refresh token is a credential. Keep `renderer/.env` out of git (it's in `.gitignore`) and off shared storage; use your platform's secret mechanism if you have one.

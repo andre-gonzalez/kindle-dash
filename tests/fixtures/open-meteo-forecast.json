@@ -1,0 +1,22 @@
+{
+  "latitude": -23.514938,
+  "longitude": -46.610504,
+  "utc_offset_seconds": -10800,
+  "timezone": "America/Sao_Paulo",
+  "current_units": {"time": "unixtime", "interval": "seconds", "temperature_2m": "°C", "apparent_temperature": "°C", "weather_code": "wmo code", "is_day": ""},
+  "current": {"time": 1793304000, "interval": 900, "temperature_2m": 18.7, "apparent_temperature": 20.9, "weather_code": 61, "is_day": 1},
+  "hourly_units": {"time": "unixtime", "precipitation_probability": "%"},
+  "hourly": {
+    "time": [1793242800, 1793246400, 1793250000, 1793253600],
+    "precipitation_probability": [24, 30, 43, null]
+  },
+  "daily_units": {"time": "unixtime", "weather_code": "wmo code", "temperature_2m_max": "°C", "temperature_2m_min": "°C", "sunrise": "unixtime", "sunset": "unixtime"},
+  "daily": {
+    "time": [1793242800, 1793329200, 1793415600],
+    "weather_code": [81, 80, 0],
+    "temperature_2m_max": [20.3, 25.6, 21.3],
+    "temperature_2m_min": [16.3, 17.0, 15.7],
+    "sunrise": [1793262145, 1793348506, 1793434868],
+    "sunset": [1793308692, 1793395125, 1793481560]
+  }
+}

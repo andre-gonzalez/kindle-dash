@@ -20,7 +20,7 @@ Scripts available in the shell:
 | `fmt` | `ruff format` the renderer |
 | `lint` | `ruff check` the renderer |
 
-Iterate on layout/widgets with `preview` — no container, no Kindle needed. Set `HA_*` / `CLAUDE_*` in your shell to exercise live sources, or monkeypatch the `fetch_*` functions in a scratch script.
+Iterate on layout/widgets with `preview` — no container, no Kindle needed. Set `DASH_LAT`/`DASH_LON` / `HA_*` / `CLAUDE_*` in your shell to exercise live sources, or monkeypatch the `fetch_*` functions in a scratch script.
 
 ## Conventions
 
