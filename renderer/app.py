@@ -29,11 +29,13 @@ import re
 import threading
 import time
 import zoneinfo
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from urllib.parse import parse_qs, urlparse
 
+import icalendar
+import recurring_ical_events
 import requests
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
@@ -65,6 +67,10 @@ HA_TOKEN = os.environ.get("HA_TOKEN", "")
 HA_CALENDAR_ENTITIES = [
     c.strip() for c in os.environ.get("HA_CALENDAR_ENTITY", "").split(",") if c.strip()
 ]
+# ICS calendars (optional) — comma list of iCal URLs, e.g. Google's "secret
+# address in iCal format". They merge into the agenda with the HA calendars.
+# Each URL is a secret (it gives read access to the calendar): never log it.
+DASH_ICS_URLS = [u.strip() for u in os.environ.get("DASH_ICS_URLS", "").split(",") if u.strip()]
 # Weather, forecast, rain chance, and sunrise/sunset come from Open-Meteo (free,
 # no key) at DASH_LAT/DASH_LON. RAIN_LAT/RAIN_LON are the old names (they set
 # the location of the old rain fallback). Units stay fixed: metric or imperial.
@@ -276,7 +282,7 @@ def fetch_open_meteo():
 
 
 def parse_events(calendars, start):
-    """Merge HA calendar event lists into [(shown_dt, HH:MM-or-'all day', summary)].
+    """Merge calendar event lists into [(shown_dt, HH:MM-or-'all day', summary)].
 
     Time-sorted, all-day events first. An event that is on more than one
     calendar (e.g. a meeting invite) shows once. A timed event that began
@@ -316,14 +322,57 @@ def visible_events(events, now):
     return rows[:MAX_EVENTS]
 
 
-def fetch_events():
-    """Today's events from every HA_CALENDAR_ENTITY (see parse_events), or None."""
-    if not HA_CALENDAR_ENTITIES:
+def parse_ics(text, start):
+    """Events of one iCal feed between start and start + 1 day, or raise.
+
+    Each event is in the HA calendar event format ({"start": {"dateTime"} or
+    {"date"}, "end": ..., "summary"}), so parse_events merges ICS and HA
+    calendars. Repeat events expand (RRULE, EXDATE, moved instances). A
+    cancelled event is left out. A time with no zone is local time.
+    """
+    def when(prop):
+        v = prop.dt if prop is not None else None
+        if isinstance(v, datetime):
+            return {"dateTime": (v if v.tzinfo else v.replace(tzinfo=TZINFO)).isoformat()}
+        if isinstance(v, date):
+            return {"date": v.isoformat()}
+        return {}
+
+    cal = icalendar.Calendar.from_ical(text)
+    return [
+        {"start": when(ev.get("DTSTART")), "end": when(ev.get("DTEND")),
+         "summary": str(ev.get("SUMMARY", ""))}
+        for ev in recurring_ical_events.of(cal).between(start, start + timedelta(days=1))
+        if str(ev.get("STATUS", "")).upper() != "CANCELLED"
+    ]
+
+
+def fetch_ics(n, url, start):
+    """Today's events from the n-th DASH_ICS_URLS feed (see parse_ics), or None.
+
+    The log names the feed by its number, never by its URL (a secret).
+    """
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        return parse_ics(r.text, start)
+    except requests.HTTPError as e:
+        print(f"[ics] calendar {n} failed: HTTP {e.response.status_code}", flush=True)
+    except Exception as e:
+        print(f"[ics] calendar {n} failed: {type(e).__name__}", flush=True)
+    return None
+
+
+def fetch_events(now=None):
+    """Today's events from every HA_CALENDAR_ENTITY and DASH_ICS_URLS feed (see
+    parse_events), or None."""
+    if not (HA_CALENDAR_ENTITIES or DASH_ICS_URLS):
         return None
-    now = datetime.now(TZINFO)
+    now = now or datetime.now(TZINFO)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     params = {"start": start.isoformat(), "end": (start + timedelta(days=1)).isoformat()}
     calendars = [_ha("GET", f"/api/calendars/{c}", **params) for c in HA_CALENDAR_ENTITIES]
+    calendars += [fetch_ics(n, url, start) for n, url in enumerate(DASH_ICS_URLS, 1)]
     calendars = [data for data in calendars if data is not None]
     if not calendars:  # every fetch failed; [] is a real "nothing today"
         return None

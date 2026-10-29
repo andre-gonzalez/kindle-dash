@@ -33,15 +33,16 @@ Conditions use the Home Assistant names (`sunny`, `clear-night`, `partlycloudy`,
 
 > **Moving from Home Assistant weather:** `HA_WEATHER_ENTITY` and `HA_SUN_ENTITY` are no longer used. If one is set, the renderer logs a warning at start and ignores it. Set `DASH_LAT`/`DASH_LON` to your home coordinates (HA → Settings → System → General shows them).
 
-## Home Assistant (agenda)
+## Agenda (ICS calendars · Home Assistant)
 
-Optional. Create a long-lived token: HA → Profile → Security → Long-lived access tokens.
+Optional. The agenda reads ICS calendar URLs, Home Assistant calendars, or both. Events from every calendar merge into one time-sorted list, and an event on more than one calendar shows once. An event with no title (for example from a calendar shared as free/busy only) shows as `busy`. If one calendar fails, the others still show; if all fail, the agenda shows `no calendar`.
 
 | Var | Example | Powers |
 |---|---|---|
-| `HA_BASE_URL` | `http://192.168.1.5:8123` | the agenda (blank = off) |
+| `DASH_ICS_URLS` | `https://calendar.google.com/calendar/ical/…/basic.ics` | comma list of iCal URLs. Google: Calendar settings → *Integrate calendar* → *Secret address in iCal format*. Outlook, iCloud, and Nextcloud publish one too. Repeat events, exceptions, and moved instances expand; cancelled events hide. **Each URL is a secret** — see [SECURITY.md](SECURITY.md#ics-calendar-urls-are-secrets). |
+| `HA_BASE_URL` | `http://192.168.1.5:8123` | Home Assistant calendars (blank = off). Create a long-lived token: HA → Profile → Security → Long-lived access tokens. |
 | `HA_TOKEN` | `eyJ…` | auth |
-| `HA_CALENDAR_ENTITY` | `calendar.personal,calendar.work` | agenda (blank = hidden). Comma list: events from every calendar merge into one time-sorted list, and an event on more than one calendar shows once. An event with no title (for example from a calendar shared as free/busy only) shows as `busy`. |
+| `HA_CALENDAR_ENTITY` | `calendar.personal,calendar.work` | comma list of HA calendar entities |
 | `DASH_MAX_EVENTS` | `4` | agenda rows |
 | `DASH_EVENT_GRACE_MIN` | `15` | minutes after its start that a timed event stays on the agenda (an 08:00 event shows until 08:15). An overnight event (`→HH:MM`) hides this long after its end. All-day events stay all day. |
 

@@ -37,18 +37,15 @@ Per-request data from the device goes in the `/dash.png` query string instead of
 
 ## Data sources
 
-The data layer is just a `fetch_*()` returning a fixed shape; the `w_*()` that draws it doesn't care where the data came from. Weather, forecast, rain, and sun come from **[Open-Meteo](https://open-meteo.com)** (free, keyless): one GET at `DASH_LAT`/`DASH_LON` returns all four, and `parse_open_meteo()` splits it. The agenda reads **Home Assistant** calendars via the `_ha()` helper. The usage widgets call their own APIs.
+The data layer is just a `fetch_*()` returning a fixed shape; the `w_*()` that draws it doesn't care where the data came from. Weather, forecast, rain, and sun come from **[Open-Meteo](https://open-meteo.com)** (free, keyless): one GET at `DASH_LAT`/`DASH_LON` returns all four, and `parse_open_meteo()` splits it. The agenda reads **ICS calendar URLs** (`icalendar` + `recurring-ical-events`) and **Home Assistant** calendars via the `_ha()` helper. The usage widgets call their own APIs.
 
-To add another integration, write a fetch for your source and return the same shape.
-
-Good candidates:
-- **Agenda → an `.ics` URL** — Google/Outlook/Apple all publish one. Recurring events need an ICS library (`icalendar` + recurrence expansion).
+To add another integration, write a fetch for your source and return the same shape. The ICS feeds show the pattern: `parse_ics()` turns each feed into the HA calendar event format, so `parse_events()` merges ICS and HA calendars with no source-specific code.
 
 Return shapes to match: weather `(condition, temp, feels)` · forecast `[(label, condition, hi, lo), …]` · rain `[(local_dt, pct_or_None), …]` · sun `(sunrise_dt, sunset_dt)` · agenda `[(shown_dt_or_None, time_label, summary), …]` (all of today's events; `w_agenda` hides the past ones and caps the rows). Conditions use the Home Assistant names (`sunny`, `clear-night`, `partlycloudy`, `rainy`, …); `wmo_condition()` maps Open-Meteo's WMO codes to them. Return `None` on any failure.
 
 ## Shipped
 
-Clock · Weather (now) · Forecast (N-day) · Rain (Open-Meteo, chance per hour) · Agenda (one or more HA calendars) · Sun (Open-Meteo sunrise/sunset) · Kindle battery (sent by the device) · Claude usage (5h/7d/Extra) · Codex usage (available windows/Credits) · opencode Go usage (5h/Week/Month) · OpenRouter spend (Month USD).
+Clock · Weather (now) · Forecast (N-day) · Rain (Open-Meteo, chance per hour) · Agenda (ICS and HA calendars) · Sun (Open-Meteo sunrise/sunset) · Kindle battery (sent by the device) · Claude usage (5h/7d/Extra) · Codex usage (available windows/Credits) · opencode Go usage (5h/Week/Month) · OpenRouter spend (Month USD).
 
 The four usage providers (`usage`=Claude, `codex`, `opencode`, `openrouter`) share one `_usage_block` renderer and split the bottom strip into a column each. Claude and Codex read OAuth usage APIs (refresh-token seeded); OpenRouter sums `usage_monthly` over all keys with a management key; **opencode has no usage API, so its widget scrapes the Go dashboard HTML** with a browser cookie — see CONFIGURATION.md for the fragility caveat.
 

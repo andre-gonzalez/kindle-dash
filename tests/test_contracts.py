@@ -1,4 +1,6 @@
+import contextlib
 import hashlib
+import io
 import json
 import pathlib
 import tempfile
@@ -304,6 +306,63 @@ class RenderContract(unittest.TestCase):
             start + timedelta(hours=11),
             start + timedelta(hours=15),
         ])
+
+    def test_ics_fixture(self):
+        sao_paulo = zoneinfo.ZoneInfo("America/Sao_Paulo")
+        start = datetime(2026, 10, 29, tzinfo=sao_paulo)
+        with mock.patch.object(app, "TZINFO", sao_paulo):
+            events = app.parse_ics((FIXTURES / "calendar.ics").read_bytes().decode(), start)
+            result = app.parse_events([events], start)
+        # A weekly repeat, a moved repeat instance, an all-day event, an
+        # overnight event, and a UTC event. Not shown: a cancelled event, an
+        # EXDATE instance (yesterday), and tomorrow's event.
+        self.assertEqual([(lbl, s) for _, lbl, s in result], [
+            ("all day", "Holiday"),
+            ("→06:15", "Flight"),
+            ("09:30", "Standup"),
+            ("12:00", "Call"),
+            ("16:00", "Review (moved)"),
+        ])
+
+    def test_agenda_merges_ics_and_ha_calendars(self):
+        sao_paulo = zoneinfo.ZoneInfo("America/Sao_Paulo")
+        now = datetime(2026, 10, 29, 8, 0, tzinfo=sao_paulo)
+        ha = [
+            # The same invite as the ICS Standup shows once.
+            {"start": {"dateTime": "2026-10-29T09:30:00-03:00"}, "summary": "Standup"},
+            {"start": {"dateTime": "2026-10-29T18:00:00-03:00"}, "summary": "Gym"},
+        ]
+        feed = mock.Mock(text=(FIXTURES / "calendar.ics").read_bytes().decode())
+        missing = mock.Mock()
+        missing.raise_for_status.side_effect = app.requests.HTTPError(
+            "404 Client Error: Not Found for url: https://secret.example/b.ics",
+            response=mock.Mock(status_code=404),
+        )
+        log = io.StringIO()
+        with (
+            mock.patch.object(app, "TZINFO", sao_paulo),
+            mock.patch.object(app, "HA_CALENDAR_ENTITIES", ["calendar.work"]),
+            mock.patch.object(app, "DASH_ICS_URLS", ["https://secret.example/a.ics",
+                                                     "https://secret.example/b.ics"]),
+            mock.patch.object(app, "_ha", return_value=ha),
+            mock.patch.object(app.requests, "get", side_effect=[feed, missing]),
+            contextlib.redirect_stdout(log),
+        ):
+            result = app.fetch_events(now)
+        self.assertEqual([s for _, _, s in result], [
+            "Holiday", "Flight", "Standup", "Call", "Review (moved)", "Gym",
+        ])
+        # A failed feed is named by its number: its URL is a secret.
+        self.assertIn("[ics] calendar 2 failed: HTTP 404", log.getvalue())
+        self.assertNotIn("secret", log.getvalue())
+        # Every feed failed: no calendar, not "nothing scheduled".
+        with (
+            mock.patch.object(app, "HA_CALENDAR_ENTITIES", []),
+            mock.patch.object(app, "DASH_ICS_URLS", ["https://secret.example/a.ics"]),
+            mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError("x")),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertIsNone(app.fetch_events())
 
     def test_agenda_hides_events_past_the_grace_period(self):
         start = datetime(2026, 7, 19, tzinfo=app.TZINFO)
