@@ -27,7 +27,7 @@ Then give it a box in `render()`:
 w_aqi(d, (mid, mid_y, rcol, (mid_b - mid_y) * 0.5))
 ```
 
-Conventions: pure black on white (e-ink is sharpest at 1-bit — `DASH_DARK` inverts the whole frame for you, so always draw dark-on-light); size fonts as a fraction of `h`; truncate text with `_trunc()`; never raise out of a widget (one that raises is logged and skipped, but keep fetches fail-soft anyway).
+Conventions: pure black on white (e-ink is sharpest at 1-bit — `DASH_DARK` inverts the whole frame for you, so always draw dark-on-light); size fonts as a fraction of `h`; truncate text with `_trunc()`; never raise out of a widget (one that raises is logged and skipped, but keep fetches fail-soft anyway). For the current time, use `datetime.now(local_tz())`, not a fixed zone: away from home the dashboard runs in the current location's time zone.
 
 Per-request data from the device goes in the `/dash.png` query string instead of a fetch: `dashboard.sh` adds `battery=82&charging=0` (from `lipc-get-prop com.lab126.powerd`), `render()` passes it to `w_battery`, and the widget draws nothing when it is missing.
 

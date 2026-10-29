@@ -7,7 +7,7 @@ All renderer config is environment variables (in `renderer/.env`; see `.env.exam
 | Var | Default | Notes |
 |---|---|---|
 | `KINDLE_W` / `KINDLE_H` | `1024` / `758` | **Landscape** (width ≥ height). Must match your panel — check `cat /sys/class/graphics/fb0/virtual_size` on the device. PW2 = `1024×758`, PW3+/Oasis = `1448×1072`. |
-| `TZ` | `UTC` | IANA tz, e.g. `America/Sao_Paulo`. Drives the clock + all formatted times. |
+| `TZ` | `UTC` | IANA tz of the **home** location, e.g. `America/Sao_Paulo`. Drives the clock + all formatted times at home; away from home they follow the current location's zone (see [Location](#location)). |
 | `DASH_ROTATE` | `0` | `0/90/180/270`. Rotates the frame **server-side** — `90` fills a portrait panel mounted sideways (`270` if upside down). |
 | `DASH_DARK` | `0` | `1` = light-on-black (e-ink dark mode; the whole frame is inverted). |
 | `DASH_WIDGETS` | all | Comma list of panels to draw, in order: `clock,weather,forecast,agenda,sun,rain,usage,battery`. Drop any to hide it. The legacy name `sunmoon` still works and expands to `sun,rain`. The usage providers (`usage`=Claude, `codex`, `opencode`, `openrouter`) share the bottom strip and split it into one column each. `battery` shows the Kindle's charge in the top-right corner; it needs no config — `dashboard.sh` sends `?battery=&charging=` with each fetch, and the panel stays blank for any other client (e.g. a browser). |
@@ -32,6 +32,19 @@ From [Open-Meteo](https://open-meteo.com): free, no API key, no account. One req
 Conditions use the Home Assistant names (`sunny`, `clear-night`, `partlycloudy`, `cloudy`, `fog`, `rainy`, `pouring`, `snowy`, `snowy-rainy`, `lightning`, `lightning-rainy`), mapped from Open-Meteo's WMO weather codes.
 
 > **Moving from Home Assistant weather:** `HA_WEATHER_ENTITY` and `HA_SUN_ENTITY` are no longer used. If one is set, the renderer logs a warning at start and ignores it. Set `DASH_LAT`/`DASH_LON` to your home coordinates (HA → Settings → System → General shows them).
+
+## Location
+
+The weather, the time zone, and a small city line under the weather follow the **current location**. The renderer selects the first one that exists:
+
+1. a **manual override**;
+2. the **geo-IP** location of the Kindle;
+3. the **last known** geo-IP location (so one failed lookup does not jump home);
+4. **home**: `DASH_LAT`/`DASH_LON` with `TZ`.
+
+Away from home, the clock, the agenda day, the sun times, the rain hours, and the usage reset times use the location's time zone. The city line shows the location name, with `(manual)` for an override. At home there is no city line, so the home dashboard looks the same as before.
+
+The override and the last known location persist in `location.json` in the state dir (`/data`), so a restart keeps them.
 
 ## Agenda (ICS calendars · Home Assistant)
 

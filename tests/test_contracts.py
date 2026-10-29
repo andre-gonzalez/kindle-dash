@@ -134,24 +134,135 @@ class ParserContract(unittest.TestCase):
         for (code, is_day), cond in cases.items():
             self.assertEqual(app.wmo_condition(code, is_day), cond, code)
 
-    def test_open_meteo_fetch_uses_the_home_location_and_units(self):
-        with (
-            mock.patch.object(app, "DASH_LAT", ""),
-            mock.patch.object(app, "requests") as req,
-        ):
-            self.assertIsNone(app.fetch_open_meteo())
+    def test_open_meteo_fetch_uses_the_location_and_units(self):
+        with mock.patch.object(app, "requests") as req:
+            self.assertIsNone(app.fetch_open_meteo(None))
         req.get.assert_not_called()
+        tokyo = {"lat": 35.68, "lon": 139.69, "tz": "Asia/Tokyo", "name": "Tokyo", "source": "manual"}
         with (
-            mock.patch.object(app, "DASH_LAT", "-23.55"),
-            mock.patch.object(app, "DASH_LON", "-46.63"),
             mock.patch.object(app, "DASH_UNITS", "imperial"),
             mock.patch.object(app, "requests") as req,
         ):
             req.get.return_value.json.return_value = self.fixture_json("open-meteo-forecast.json")
-            self.assertEqual(app.fetch_open_meteo()["weather"][0], "rainy")
+            result = app.fetch_open_meteo(tokyo)
+        self.assertEqual(result["weather"][0], "rainy")
+        # Times are in the location's zone, not the home TZ.
+        self.assertEqual(result["hourly"][0][0].tzinfo, zoneinfo.ZoneInfo("Asia/Tokyo"))
         params = req.get.call_args.kwargs["params"]
-        self.assertEqual((params["latitude"], params["longitude"]), ("-23.55", "-46.63"))
-        self.assertEqual(params["temperature_unit"], "fahrenheit")
+        self.assertEqual((params["latitude"], params["longitude"]), (35.68, 139.69))
+        self.assertEqual((params["timezone"], params["temperature_unit"]), ("Asia/Tokyo", "fahrenheit"))
+
+
+LISBON = {"lat": 38.72, "lon": -9.14, "tz": "Europe/Lisbon", "name": "Lisbon", "source": "geoip"}
+TOKYO = {"lat": 35.68, "lon": 139.69, "tz": "Asia/Tokyo", "name": "Tokyo", "source": "manual"}
+HOME = {"lat": -23.55, "lon": -46.63, "tz": "America/Sao_Paulo", "name": "", "source": "home"}
+
+
+class LocationContract(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = str(pathlib.Path(tmp.name, "location.json"))
+        for name, value in {
+            "LOCATION_FILE": self.path, "HOME": HOME, "GEO_LOCATION": None,
+            "LOCATION": {"override": None, "last": None},
+        }.items():
+            patcher = mock.patch.object(app, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        app.POLL_WAKE.clear()
+
+    def test_priority_is_override_geoip_last_home(self):
+        last = {**LISBON, "name": "Porto"}
+        self.assertEqual(app.resolve_location(TOKYO, LISBON, last, HOME), TOKYO)
+        self.assertEqual(app.resolve_location(None, LISBON, last, HOME), LISBON)
+        self.assertEqual(app.resolve_location(None, None, last, HOME), last)
+        self.assertEqual(app.resolve_location(None, None, None, HOME), HOME)
+        self.assertIsNone(app.resolve_location(None, None, None, None))
+        # An override is always "manual".
+        self.assertEqual(app.resolve_location(LISBON, None, None, HOME)["source"], "manual")
+
+    def test_home_comes_from_env(self):
+        self.assertEqual(
+            app.valid_location({"lat": "-23.55", "lon": "-46.63", "tz": "America/Sao_Paulo"}, "home"),
+            HOME,
+        )
+        for bad in ({"lat": "", "lon": "", "tz": "UTC"}, {"lat": 91, "lon": 0, "tz": "UTC"},
+                    {"lat": 1, "lon": 2, "tz": "Not/AZone"}, {}):
+            self.assertIsNone(app.valid_location(bad, "home"), bad)
+
+    def test_override_and_last_survive_a_restart(self):
+        app.update_location(override=TOKYO, last=LISBON)
+        self.assertEqual(app.load_location(self.path), {"override": TOKYO, "last": LISBON})
+        # A damaged or hand-edited file gives no location, not a crash.
+        pathlib.Path(self.path).write_text('{"override": {"lat": "x"}, "last": 3}')
+        self.assertEqual(app.load_location(self.path), {"override": None, "last": None})
+        pathlib.Path(self.path).write_text("not json")
+        self.assertEqual(app.load_location(self.path), {"override": None, "last": None})
+
+    def test_a_location_change_wakes_the_poll(self):
+        app.update_location(last=None)  # no change
+        self.assertFalse(app.POLL_WAKE.is_set())
+        app.update_location(override=TOKYO)
+        self.assertTrue(app.POLL_WAKE.is_set())
+        self.assertEqual(app.current_location(), TOKYO)
+
+    def test_poll_fetches_the_weather_for_the_current_location(self):
+        app.update_location(override=TOKYO)
+        with (
+            mock.patch.object(app, "fetch_open_meteo", return_value=None) as meteo,
+            mock.patch.object(app, "fetch_events", return_value=None),
+            mock.patch.object(app, "DATA", {}),
+        ):
+            app.poll_once()
+            self.assertEqual(meteo.call_args.args[0], TOKYO)
+            self.assertEqual(app.DATA["location"], TOKYO)
+            self.assertEqual(app.DATA["weather"], (None, None, None))
+
+    def test_time_zone_follows_the_location(self):
+        with mock.patch.object(app, "TZINFO", timezone.utc):
+            self.assertEqual(app.local_tz(), timezone.utc)  # home: TZ
+            app.update_location(override=TOKYO)
+            self.assertEqual(app.local_tz(), zoneinfo.ZoneInfo("Asia/Tokyo"))
+            # The agenda asks for the Tokyo day, from Tokyo midnight.
+            with (
+                mock.patch.object(app, "HA_CALENDAR_ENTITIES", ["calendar.a"]),
+                mock.patch.object(app, "DASH_ICS_URLS", []),
+                mock.patch.object(app, "_ha", return_value=[]) as ha,
+            ):
+                app.fetch_events()
+            start = datetime.fromisoformat(ha.call_args.kwargs["start"])
+            self.assertEqual(start.utcoffset(), timedelta(hours=9))
+            self.assertEqual((start.hour, start.minute), (0, 0))
+
+    def test_city_label(self):
+        self.assertEqual(app.location_label(None), "")
+        self.assertEqual(app.location_label(HOME), "")
+        self.assertEqual(app.location_label(LISBON), "Lisbon")
+        self.assertEqual(app.location_label(TOKYO), "Tokyo (manual)")
+        self.assertEqual(app.location_label({**LISBON, "name": ""}), "38.72, -9.14")
+
+    @unittest.skipUnless(
+        pathlib.Path(app.FONT_DIR, "DejaVuSans.ttf").exists(), "needs the DejaVu fonts (DASH_FONT_DIR)"
+    )
+    def test_city_line_shows_only_away_from_home(self):
+        def weather(loc):
+            image = Image.new("L", (480, 150), 255)
+            with mock.patch.dict(app.DATA, {"weather": ("rainy", 17, 15), "location": loc}):
+                app.w_weather(ImageDraw.Draw(image), (0, 0, 480, 150))
+            return image
+
+        # The city line: right of the icon (r = 0.32 h), under the condition.
+        line = (int(150 * 0.32 * 2.5 + 16), int(150 * 0.82), 480, 150)
+        self.assertEqual(weather(HOME).tobytes(), weather(None).tobytes())
+        self.assertIsNone(ImageOps.invert(weather(HOME).crop(line)).getbbox())
+        geoip = ImageOps.invert(weather(LISBON).crop(line)).getbbox()
+        manual = ImageOps.invert(weather({**LISBON, "source": "manual"}).crop(line)).getbbox()
+        self.assertIsNotNone(geoip)
+        self.assertGreater(manual[2], geoip[2])  # " (manual)" makes it longer
+        # The rows above the city line do not change.
+        top = (0, 0, 480, line[1])
+        self.assertEqual(weather(LISBON).crop(top).tobytes(), weather(HOME).crop(top).tobytes())
 
 
 class RenderContract(unittest.TestCase):

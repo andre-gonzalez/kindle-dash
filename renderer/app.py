@@ -151,6 +151,94 @@ def _font(bold, size):
     return ImageFont.truetype(os.path.join(FONT_DIR, name), int(size))
 
 
+# --- location: the weather, the time zone, and the city line follow it ------
+# A location is {"lat", "lon", "tz" (IANA name), "name", "source"}; source is
+# "manual" (an override), "geoip" (the Kindle's public IP), or "home"
+# (DASH_LAT/DASH_LON + TZ). The override and the last geo-IP location persist
+# in LOCATION_FILE, so a restart or a failed lookup does not jump home.
+LOCATION_FILE = os.path.join(STATE_DIR, "location.json")
+
+
+def valid_location(loc, source=None):
+    """loc as a clean location dict (with `source` if given), or None if it is not one."""
+    try:
+        lat, lon = float(loc["lat"]), float(loc["lon"])
+        zoneinfo.ZoneInfo(loc["tz"])
+    except Exception:
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return {"lat": lat, "lon": lon, "tz": loc["tz"], "name": str(loc.get("name") or ""),
+            "source": source or str(loc.get("source") or "")}
+
+
+HOME = valid_location({"lat": DASH_LAT, "lon": DASH_LON, "tz": TZ}, "home")
+
+
+def resolve_location(override, geo, last, home):
+    """The current location: the override, else the geo-IP location, else the
+    last known one, else home. Or None when none of them exists."""
+    if override:
+        return {**override, "source": "manual"}
+    return geo or last or home
+
+
+def load_location(path=None):
+    """{"override": location-or-None, "last": location-or-None} from the state file."""
+    try:
+        with open(path or LOCATION_FILE) as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    return {"override": valid_location(data.get("override") or {}, "manual"),
+            "last": valid_location(data.get("last") or {})}
+
+
+def save_location(state, path=None):
+    path = path or LOCATION_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, path)
+
+
+LOCATION = load_location()
+GEO_LOCATION = None  # geo-IP location of the Kindle's current IP, when known
+# Set when the current location changes: data_poll_loop fetches at once.
+POLL_WAKE = threading.Event()
+
+
+def current_location():
+    return resolve_location(LOCATION["override"], GEO_LOCATION, LOCATION["last"], HOME)
+
+
+def update_location(**changes):
+    """Change the stored override and/or last location, persist them, and wake
+    the data poll if the current location changed."""
+    global LOCATION
+    before = current_location()
+    LOCATION = {**LOCATION, **changes}
+    try:
+        save_location(LOCATION)
+    except Exception as e:  # keep the change in memory; it is lost on restart
+        print(f"[location] save failed: {e}", flush=True)
+    if current_location() != before:
+        POLL_WAKE.set()
+
+
+def location_tz(loc):
+    """Time zone of a location; TZ at home or with no location."""
+    if not loc or loc["source"] == "home":
+        return TZINFO
+    return zoneinfo.ZoneInfo(loc["tz"])
+
+
+def local_tz():
+    """Time zone of the current location (see location_tz)."""
+    return location_tz(current_location())
+
+
 # --- Home Assistant helpers ------------------------------------------------
 def _ha(method, path, body=None, **params):
     if not (HA_BASE_URL and HA_TOKEN):
@@ -174,7 +262,7 @@ def _ha(method, path, body=None, **params):
 def _local(iso):
     """Parse an ISO timestamp to local tz, or None."""
     try:
-        return datetime.fromisoformat(iso).astimezone(TZINFO)
+        return datetime.fromisoformat(iso).astimezone(local_tz())
     except Exception:
         return None
 
@@ -203,16 +291,17 @@ def _num(v):
     return v if isinstance(v, (int, float)) else None
 
 
-def parse_open_meteo(data, now=None):
+def parse_open_meteo(data, now=None, tz=None):
     """Weather, forecast, hourly rain, and sun from an Open-Meteo unixtime response.
 
     {"weather": (condition, temp, feels), "forecast": [(label, condition, hi, lo)]
     or None, "hourly": [(local_dt, rain_pct-or-None)] or None, "sun":
     (sunrise_dt, sunset_dt)}, or None if the response has no usable data. Sun
     times are the next sunrise and the next sunset after now, as HA's sun.sun
-    gave them.
+    gave them. Times are in tz (default: the current location's).
     """
-    now = now or datetime.now(TZINFO)
+    tz = tz or local_tz()
+    now = now or datetime.now(tz)
     try:
         cur, daily, hourly = data["current"], data["daily"], data["hourly"]
     except Exception:
@@ -229,7 +318,7 @@ def parse_open_meteo(data, now=None):
         days = zip(daily["time"], daily["weather_code"],
                    daily["temperature_2m_max"], daily["temperature_2m_min"])
         forecast = [
-            (datetime.fromtimestamp(t, TZINFO).strftime("%a"), wmo_condition(code),
+            (datetime.fromtimestamp(t, tz).strftime("%a"), wmo_condition(code),
              _num(hi), _num(lo))
             for t, code, hi, lo in days
         ][:FORECAST_DAYS] or None
@@ -237,14 +326,14 @@ def parse_open_meteo(data, now=None):
         forecast = None
     try:
         hours = [
-            (datetime.fromtimestamp(t, TZINFO), round(p) if isinstance(p, (int, float)) else None)
+            (datetime.fromtimestamp(t, tz), round(p) if isinstance(p, (int, float)) else None)
             for t, p in zip(hourly["time"], hourly["precipitation_probability"])
         ] or None
     except Exception:
         hours = None
     try:
         def next_after(times):
-            return next((datetime.fromtimestamp(t, TZINFO) for t in times
+            return next((datetime.fromtimestamp(t, tz) for t in times
                          if isinstance(t, (int, float)) and t > now.timestamp()), None)
         sun = (next_after(daily["sunrise"]), next_after(daily["sunset"]))
     except Exception:
@@ -254,20 +343,21 @@ def parse_open_meteo(data, now=None):
     return {"weather": weather, "forecast": forecast, "hourly": hours, "sun": sun}
 
 
-def fetch_open_meteo():
-    """Weather, forecast, hourly rain, and sun from Open-Meteo (see parse_open_meteo), or None."""
-    if not (DASH_LAT and DASH_LON):
+def fetch_open_meteo(loc):
+    """Weather, forecast, hourly rain, and sun at location loc from Open-Meteo
+    (see parse_open_meteo), or None."""
+    if not loc:
         return None
     try:
         r = requests.get(
             OPEN_METEO_URL,
             params={
-                "latitude": DASH_LAT, "longitude": DASH_LON,
+                "latitude": loc["lat"], "longitude": loc["lon"],
                 "current": "temperature_2m,apparent_temperature,weather_code,is_day",
                 "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset",
                 "hourly": "precipitation_probability",
                 "temperature_unit": "fahrenheit" if DASH_UNITS == "imperial" else "celsius",
-                "timezone": TZ, "timeformat": "unixtime",
+                "timezone": loc["tz"], "timeformat": "unixtime",
                 # The forecast strip, tomorrow's sunrise after today's sunset,
                 # and enough hours from now to fill RAIN_HOURS.
                 "forecast_days": max(FORECAST_DAYS, 2, 1 + -(-RAIN_HOURS // 24)),
@@ -275,7 +365,7 @@ def fetch_open_meteo():
             timeout=8,
         )
         r.raise_for_status()
-        return parse_open_meteo(r.json())
+        return parse_open_meteo(r.json(), tz=location_tz(loc))
     except Exception as e:
         print(f"[open-meteo] fetch failed: {e}", flush=True)
         return None
@@ -333,7 +423,7 @@ def parse_ics(text, start):
     def when(prop):
         v = prop.dt if prop is not None else None
         if isinstance(v, datetime):
-            return {"dateTime": (v if v.tzinfo else v.replace(tzinfo=TZINFO)).isoformat()}
+            return {"dateTime": (v if v.tzinfo else v.replace(tzinfo=local_tz())).isoformat()}
         if isinstance(v, date):
             return {"date": v.isoformat()}
         return {}
@@ -368,7 +458,7 @@ def fetch_events(now=None):
     parse_events), or None."""
     if not (HA_CALENDAR_ENTITIES or DASH_ICS_URLS):
         return None
-    now = now or datetime.now(TZINFO)
+    now = now or datetime.now(local_tz())
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     params = {"start": start.isoformat(), "end": (start + timedelta(days=1)).isoformat()}
     calendars = [_ha("GET", f"/api/calendars/{c}", **params) for c in HA_CALENDAR_ENTITIES]
@@ -384,15 +474,22 @@ def fetch_events(now=None):
 # calendar fetches there would block the response on serial network calls.
 # Instead poll them in the background and have the widgets read this snapshot
 # (rebound atomically, so a reader always sees one consistent dict).
+# "location" is the location that the weather is for (the city line shows it).
 NO_WEATHER = {"weather": (None, None, None), "forecast": None, "hourly": None, "sun": (None, None)}
-DATA = {**NO_WEATHER, "events": None}
+DATA = {**NO_WEATHER, "events": None, "location": None}
+
+
+def poll_once():
+    global DATA
+    loc = current_location()
+    DATA = {**(fetch_open_meteo(loc) or NO_WEATHER), "events": fetch_events(), "location": loc}
 
 
 def data_poll_loop():
-    global DATA
     while True:
-        DATA = {**(fetch_open_meteo() or NO_WEATHER), "events": fetch_events()}
-        time.sleep(DASH_POLL_MIN * 60)
+        POLL_WAKE.clear()  # before the fetch: a change during it polls again
+        poll_once()
+        POLL_WAKE.wait(DASH_POLL_MIN * 60)
 
 
 # --- Claude usage: OAuth token refresh + usage fetch -----------------------
@@ -463,7 +560,7 @@ def parse_claude_usage(data, now=None):
         if not iso:
             return ""
         try:
-            return datetime.fromisoformat(iso).astimezone(TZINFO).strftime("%b %d, %H:%M")
+            return datetime.fromisoformat(iso).astimezone(local_tz()).strftime("%b %d, %H:%M")
         except Exception:
             return ""
 
@@ -543,7 +640,7 @@ def _reset_fmt(seconds=None, at=None, now=None):
             dt = datetime.fromtimestamp(v, timezone.utc)
         else:
             return ""
-        return dt.astimezone(TZINFO).strftime("%b %d, %H:%M")
+        return dt.astimezone(local_tz()).strftime("%b %d, %H:%M")
     except Exception:
         return ""
 
@@ -864,15 +961,16 @@ def parse_battery(q):
 # --- widgets: each draws inside box = (x, y, w, h) -------------------------
 def w_clock(d, box):
     x, y, w, h = box
-    now = datetime.now(TZINFO)
+    now = datetime.now(local_tz())
     d.text((x, y), now.strftime("%H:%M"), font=_font(True, h * 0.62), fill=0)
     d.text((x, y + h * 0.66), now.strftime("%a - %d/%m/%Y"), font=_font(False, h * 0.2), fill=0)
 
 
 def w_weather(d, box, right=None):
-    """Icon, temperature, condition. The temperature ends left of `right`
-    (default: the box edge): its font shrinks for a long reading like 100° or
-    -10°, so it never runs into the battery that shares its row."""
+    """Icon, temperature, condition, and the city line away from home (see
+    location_label). The temperature ends left of `right` (default: the box
+    edge): its font shrinks for a long reading like 100° or -10°, so it never
+    runs into the battery that shares its row."""
     x, y, w, h = box
     cond, temp, feels = DATA["weather"]
     r = h * 0.32
@@ -894,6 +992,19 @@ def w_weather(d, box, right=None):
         d.text((tx, y + h * 0.62), sub, font=_font(False, h * 0.16), fill=0)
     else:
         d.text((tx, y + h * 0.3), "weather n/a", font=_font(False, h * 0.18), fill=0)
+    label = location_label(DATA.get("location"))
+    if label:
+        f = _font(False, h * 0.13)
+        d.text((tx, y + h * 0.82), _trunc(d, label, f, x + w - tx), font=f, fill=0)
+
+
+def location_label(loc):
+    """The city line under the weather: the name ('(manual)' for an override),
+    or '' at home, where the dashboard looks as it did before travel support."""
+    if not loc or loc["source"] == "home":
+        return ""
+    name = loc["name"] or f"{loc['lat']:.2f}, {loc['lon']:.2f}"
+    return f"{name} (manual)" if loc["source"] == "manual" else name
 
 
 def w_forecast(d, box):
@@ -921,7 +1032,7 @@ def w_agenda(d, box):
     if events is None:
         d.text((x, yy), "no calendar", font=f, fill=0)
         return
-    events = visible_events(events, datetime.now(TZINFO))
+    events = visible_events(events, datetime.now(local_tz()))
     if not events:
         d.text((x, yy), "nothing scheduled", font=f, fill=0)
         return
@@ -946,7 +1057,7 @@ def w_rain(d, box):
     x, y, w, h = box
     d.text((x, y), "RAIN CHANCE", font=_font(True, h * 0.14), fill=0)
     f = _font(False, h * 0.14)
-    now = datetime.now(TZINFO).replace(minute=0, second=0, microsecond=0)
+    now = datetime.now(local_tz()).replace(minute=0, second=0, microsecond=0)
     hours = [(dt, pct) for dt, pct in DATA["hourly"] or [] if dt >= now][:RAIN_HOURS]
     if not hours:
         d.text((x, y + h * 0.25), "rain n/a", font=f, fill=0)
@@ -1189,8 +1300,8 @@ if __name__ == "__main__":
         if os.environ.get(var):
             print(f"[config] {var} is ignored: weather and sun come from Open-Meteo "
                   "at DASH_LAT/DASH_LON", flush=True)
-    if not (DASH_LAT and DASH_LON):
-        print("[config] DASH_LAT/DASH_LON not set: no weather, forecast, rain, or sun", flush=True)
+    if not HOME:
+        print("[config] DASH_LAT/DASH_LON/TZ not valid: no home location for the weather", flush=True)
     threading.Thread(target=data_poll_loop, daemon=True).start()
     if CLAUDE_REFRESH_TOKEN or os.path.exists(TOKEN_FILE):
         threading.Thread(target=usage_poll_loop, daemon=True).start()
