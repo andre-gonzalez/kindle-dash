@@ -58,26 +58,27 @@ DASH_WIDGETS = [
 # rain chance); expand the legacy name so existing configs keep working.
 DASH_WIDGETS = [n for w in DASH_WIDGETS for n in (("sun", "rain") if w == "sunmoon" else (w,))]
 
-# Home Assistant (optional) — powers weather, forecast, rain, sun, and agenda widgets.
+# Home Assistant (optional) — powers the agenda widget.
 HA_BASE_URL = os.environ.get("HA_BASE_URL", "").rstrip("/")
 HA_TOKEN = os.environ.get("HA_TOKEN", "")
-HA_WEATHER_ENTITY = os.environ.get("HA_WEATHER_ENTITY", "")
 # Comma list: the agenda merges every calendar into one time-sorted list.
 HA_CALENDAR_ENTITIES = [
     c.strip() for c in os.environ.get("HA_CALENDAR_ENTITY", "").split(",") if c.strip()
 ]
-HA_SUN_ENTITY = os.environ.get("HA_SUN_ENTITY", "sun.sun")
+# Weather, forecast, rain chance, and sunrise/sunset come from Open-Meteo (free,
+# no key) at DASH_LAT/DASH_LON. RAIN_LAT/RAIN_LON are the old names (they set
+# the location of the old rain fallback). Units stay fixed: metric or imperial.
+OPEN_METEO_URL = os.environ.get("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
+DASH_LAT = os.environ.get("DASH_LAT") or os.environ.get("RAIN_LAT", "")
+DASH_LON = os.environ.get("DASH_LON") or os.environ.get("RAIN_LON", "")
+DASH_UNITS = os.environ.get("DASH_UNITS", "metric").lower()
+# Old HA weather vars: the renderer ignores them and warns once at start.
+OLD_WEATHER_VARS = ("HA_WEATHER_ENTITY", "HA_SUN_ENTITY")
 FORECAST_DAYS = int(os.environ.get("FORECAST_DAYS", "3"))
 RAIN_HOURS = int(os.environ.get("RAIN_HOURS", "12"))  # columns in the rain chart
-# Rain chance falls back to Open-Meteo (free, no key) when the HA weather entity
-# has no hourly precipitation_probability (e.g. Met.no). The location defaults
-# to HA's home coordinates; RAIN_LAT/RAIN_LON override it.
-OPEN_METEO_URL = os.environ.get("OPEN_METEO_URL", "https://api.open-meteo.com/v1/forecast")
-RAIN_LAT = os.environ.get("RAIN_LAT", "")
-RAIN_LON = os.environ.get("RAIN_LON", "")
 MAX_EVENTS = int(os.environ.get("DASH_MAX_EVENTS", "4"))
 EVENT_GRACE_MIN = int(os.environ.get("DASH_EVENT_GRACE_MIN", "15"))  # past-event hide delay
-DASH_POLL_MIN = int(os.environ.get("DASH_POLL_MIN", "5"))  # HA refresh cadence
+DASH_POLL_MIN = int(os.environ.get("DASH_POLL_MIN", "5"))  # weather + agenda refresh cadence
 
 # Claude usage (optional) — fetched from the OAuth usage API; the short-lived
 # access token is refreshed from a seeded refresh token (its OWN login — see
@@ -172,83 +173,98 @@ def _local(iso):
         return None
 
 
-def fetch_weather():
-    """(condition, temp, feels) or (None, None, None)."""
-    data = _ha("GET", f"/api/states/{HA_WEATHER_ENTITY}") if HA_WEATHER_ENTITY else None
-    if not data:
-        return None, None, None
-    a = data.get("attributes", {})
-    return data.get("state"), a.get("temperature"), a.get("apparent_temperature")
+# WMO weather code -> the HA condition names that draw_weather_icon and the
+# weather line use (the same map as the HA Open-Meteo integration).
+WMO_CONDITIONS = {
+    0: "sunny", 1: "sunny", 2: "partlycloudy", 3: "cloudy", 45: "fog", 48: "fog",
+    51: "rainy", 53: "rainy", 55: "rainy", 56: "snowy-rainy", 57: "snowy-rainy",
+    61: "rainy", 63: "rainy", 65: "pouring", 66: "snowy-rainy", 67: "snowy-rainy",
+    71: "snowy", 73: "snowy", 75: "snowy", 77: "snowy",
+    80: "rainy", 81: "rainy", 82: "pouring", 85: "snowy", 86: "snowy",
+    95: "lightning", 96: "lightning-rainy", 99: "lightning-rainy",
+}
 
 
-def fetch_forecast():
-    """List of (label, condition, hi, lo) for the next days, or None."""
-    if not HA_WEATHER_ENTITY:
-        return None
-    resp = _ha(
-        "POST",
-        "/api/services/weather/get_forecasts",
-        {"entity_id": HA_WEATHER_ENTITY, "type": "daily"},
-        return_response="true",
-    )
+def wmo_condition(code, is_day=True):
+    """HA condition name for a WMO weather code, or None. A clear night is 'clear-night'."""
+    cond = WMO_CONDITIONS.get(code)
+    if cond == "sunny" and not is_day:
+        return "clear-night"
+    return cond
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) else None
+
+
+def parse_open_meteo(data, now=None):
+    """Weather, forecast, hourly rain, and sun from an Open-Meteo unixtime response.
+
+    {"weather": (condition, temp, feels), "forecast": [(label, condition, hi, lo)]
+    or None, "hourly": [(local_dt, rain_pct-or-None)] or None, "sun":
+    (sunrise_dt, sunset_dt)}, or None if the response has no usable data. Sun
+    times are the next sunrise and the next sunset after now, as HA's sun.sun
+    gave them.
+    """
+    now = now or datetime.now(TZINFO)
     try:
-        days = resp["service_response"][HA_WEATHER_ENTITY]["forecast"]
+        cur, daily, hourly = data["current"], data["daily"], data["hourly"]
     except Exception:
         return None
-    out = []
-    for f in days[:FORECAST_DAYS]:
-        dt = _local(f.get("datetime"))
-        out.append((dt.strftime("%a") if dt else "", f.get("condition"),
-                    f.get("temperature"), f.get("templow")))
-    return out or None
-
-
-def parse_hourly(resp, entity):
-    """[(local_dt, rain_pct-or-None)] from a get_forecasts hourly response, or None."""
     try:
-        hours = resp["service_response"][entity]["forecast"]
+        weather = (
+            wmo_condition(cur.get("weather_code"), cur.get("is_day", 1)),
+            _num(cur.get("temperature_2m")),
+            _num(cur.get("apparent_temperature")),
+        )
     except Exception:
-        return None
-    out = []
-    for f in hours:
-        dt = _local(f.get("datetime"))
-        if dt is None:
-            continue
-        pct = f.get("precipitation_probability")
-        out.append((dt, round(pct) if isinstance(pct, (int, float)) else None))
-    return out or None
-
-
-def parse_open_meteo(data):
-    """[(local_dt, rain_pct-or-None)] from an Open-Meteo unixtime response, or None."""
+        weather = (None, None, None)
     try:
-        h = data["hourly"]
-        pairs = list(zip(h["time"], h["precipitation_probability"]))
+        days = zip(daily["time"], daily["weather_code"],
+                   daily["temperature_2m_max"], daily["temperature_2m_min"])
+        forecast = [
+            (datetime.fromtimestamp(t, TZINFO).strftime("%a"), wmo_condition(code),
+             _num(hi), _num(lo))
+            for t, code, hi, lo in days
+        ][:FORECAST_DAYS] or None
     except Exception:
+        forecast = None
+    try:
+        hours = [
+            (datetime.fromtimestamp(t, TZINFO), round(p) if isinstance(p, (int, float)) else None)
+            for t, p in zip(hourly["time"], hourly["precipitation_probability"])
+        ] or None
+    except Exception:
+        hours = None
+    try:
+        def next_after(times):
+            return next((datetime.fromtimestamp(t, TZINFO) for t in times
+                         if isinstance(t, (int, float)) and t > now.timestamp()), None)
+        sun = (next_after(daily["sunrise"]), next_after(daily["sunset"]))
+    except Exception:
+        sun = (None, None)
+    if weather[1] is None and not forecast and not hours and sun == (None, None):
         return None
-    out = [
-        (datetime.fromtimestamp(t, TZINFO), round(p) if isinstance(p, (int, float)) else None)
-        for t, p in pairs
-    ]
-    return out or None
+    return {"weather": weather, "forecast": forecast, "hourly": hours, "sun": sun}
 
 
 def fetch_open_meteo():
-    """Hourly rain probability from Open-Meteo (see parse_open_meteo), or None."""
-    if RAIN_LAT and RAIN_LON:
-        lat, lon = RAIN_LAT, RAIN_LON
-    else:
-        cfg = _ha("GET", "/api/config") or {}
-        lat, lon = cfg.get("latitude"), cfg.get("longitude")
-    if lat is None or lon is None:
+    """Weather, forecast, hourly rain, and sun from Open-Meteo (see parse_open_meteo), or None."""
+    if not (DASH_LAT and DASH_LON):
         return None
     try:
         r = requests.get(
             OPEN_METEO_URL,
             params={
-                "latitude": lat, "longitude": lon,
-                "hourly": "precipitation_probability", "timeformat": "unixtime",
-                "forecast_days": 1 + -(-RAIN_HOURS // 24),  # today + enough to cover RAIN_HOURS
+                "latitude": DASH_LAT, "longitude": DASH_LON,
+                "current": "temperature_2m,apparent_temperature,weather_code,is_day",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset",
+                "hourly": "precipitation_probability",
+                "temperature_unit": "fahrenheit" if DASH_UNITS == "imperial" else "celsius",
+                "timezone": TZ, "timeformat": "unixtime",
+                # The forecast strip, tomorrow's sunrise after today's sunset,
+                # and enough hours from now to fill RAIN_HOURS.
+                "forecast_days": max(FORECAST_DAYS, 2, 1 + -(-RAIN_HOURS // 24)),
             },
             timeout=8,
         )
@@ -257,31 +273,6 @@ def fetch_open_meteo():
     except Exception as e:
         print(f"[open-meteo] fetch failed: {e}", flush=True)
         return None
-
-
-def fetch_hourly():
-    """Hourly rain probability: the HA weather entity, else Open-Meteo. Or None."""
-    hours = None
-    if HA_WEATHER_ENTITY:
-        resp = _ha(
-            "POST",
-            "/api/services/weather/get_forecasts",
-            {"entity_id": HA_WEATHER_ENTITY, "type": "hourly"},
-            return_response="true",
-        )
-        hours = parse_hourly(resp, HA_WEATHER_ENTITY)
-    if hours and any(pct is not None for _, pct in hours):
-        return hours
-    return fetch_open_meteo() or hours
-
-
-def fetch_sun():
-    """(sunrise_dt, sunset_dt) in local tz, or (None, None)."""
-    data = _ha("GET", f"/api/states/{HA_SUN_ENTITY}") if HA_SUN_ENTITY else None
-    if not data:
-        return None, None
-    a = data.get("attributes", {})
-    return _local(a.get("next_rising")), _local(a.get("next_setting"))
 
 
 def parse_events(calendars, start):
@@ -317,7 +308,7 @@ def visible_events(events, now):
     """The first MAX_EVENTS agenda rows as [(label, summary)].
 
     A timed event hides EVENT_GRACE_MIN after its shown time (an 08:00 event
-    shows until 08:15). This runs at render time, not in the HA poll, so an
+    shows until 08:15). This runs at render time, not in the data poll, so an
     event hides on time even between polls.
     """
     grace = timedelta(minutes=EVENT_GRACE_MIN)
@@ -339,27 +330,19 @@ def fetch_events():
     return parse_events(calendars, start)
 
 
-# --- HA data cache: a background thread keeps render() free of network I/O --
-# render() runs on every GET /dash.png (~once a minute); doing the four HA
-# fetches there would block the response on serial network calls. Instead poll
-# them in the background and have the widgets read this snapshot (rebound
-# atomically, so a reader always sees one consistent dict).
-HA_DATA = {
-    "weather": (None, None, None), "forecast": None, "hourly": None,
-    "sun": (None, None), "events": None,
-}
+# --- data cache: a background thread keeps render() free of network I/O ----
+# render() runs on every GET /dash.png (~once a minute); doing the weather and
+# calendar fetches there would block the response on serial network calls.
+# Instead poll them in the background and have the widgets read this snapshot
+# (rebound atomically, so a reader always sees one consistent dict).
+NO_WEATHER = {"weather": (None, None, None), "forecast": None, "hourly": None, "sun": (None, None)}
+DATA = {**NO_WEATHER, "events": None}
 
 
-def ha_poll_loop():
-    global HA_DATA
+def data_poll_loop():
+    global DATA
     while True:
-        HA_DATA = {
-            "weather": fetch_weather(),
-            "forecast": fetch_forecast(),
-            "hourly": fetch_hourly(),
-            "sun": fetch_sun(),
-            "events": fetch_events(),
-        }
+        DATA = {**(fetch_open_meteo() or NO_WEATHER), "events": fetch_events()}
         time.sleep(DASH_POLL_MIN * 60)
 
 
@@ -842,7 +825,7 @@ def w_weather(d, box, right=None):
     (default: the box edge): its font shrinks for a long reading like 100° or
     -10°, so it never runs into the battery that shares its row."""
     x, y, w, h = box
-    cond, temp, feels = HA_DATA["weather"]
+    cond, temp, feels = DATA["weather"]
     r = h * 0.32
     cx, cy = x + r * 1.5, y + h * 0.42
     draw_weather_icon(d, cx, cy, r, cond if temp is not None else "cloudy")
@@ -866,7 +849,7 @@ def w_weather(d, box, right=None):
 
 def w_forecast(d, box):
     x, y, w, h = box
-    days = HA_DATA["forecast"]
+    days = DATA["forecast"]
     if not days:
         return
     cw = w / len(days)
@@ -884,7 +867,7 @@ def w_agenda(d, box):
     x, y, w, h = box
     d.text((x, y), "TODAY", font=_font(True, h * 0.14), fill=0)
     yy = y + h * 0.2
-    events = HA_DATA["events"]
+    events = DATA["events"]
     f = _font(False, h * 0.13)
     if events is None:
         d.text((x, yy), "no calendar", font=f, fill=0)
@@ -902,7 +885,7 @@ def w_agenda(d, box):
 
 def w_sun(d, box):
     x, y, w, h = box
-    rise, sett = HA_DATA["sun"]
+    rise, sett = DATA["sun"]
     f = _font(False, h * 0.62)
     d.text((x, y), "SUN", font=_font(True, h * 0.62), fill=0)
     d.text((x + w * 0.14, y), f"^ {rise.strftime('%H:%M')}" if rise else "^ --", font=f, fill=0)
@@ -915,12 +898,12 @@ def w_rain(d, box):
     d.text((x, y), "RAIN CHANCE", font=_font(True, h * 0.14), fill=0)
     f = _font(False, h * 0.14)
     now = datetime.now(TZINFO).replace(minute=0, second=0, microsecond=0)
-    hours = [(dt, pct) for dt, pct in HA_DATA["hourly"] or [] if dt >= now][:RAIN_HOURS]
+    hours = [(dt, pct) for dt, pct in DATA["hourly"] or [] if dt >= now][:RAIN_HOURS]
     if not hours:
         d.text((x, y + h * 0.25), "rain n/a", font=f, fill=0)
         return
-    # Fixed pitch (not w/len(hours)) so bars keep their width when HA returns
-    # fewer hours than RAIN_HOURS.
+    # Fixed pitch (not w/len(hours)) so bars keep their width when the source
+    # returns fewer hours than RAIN_HOURS.
     cw = w / RAIN_HOURS
     bw = cw * 0.6
     top, base = y + h * 0.40, y + h * 0.80
@@ -1153,8 +1136,13 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"kindle-dash on :8080  ({KINDLE_W}x{KINDLE_H}, tz={TZ})", flush=True)
-    if HA_BASE_URL or (RAIN_LAT and RAIN_LON):
-        threading.Thread(target=ha_poll_loop, daemon=True).start()
+    for var in OLD_WEATHER_VARS:
+        if os.environ.get(var):
+            print(f"[config] {var} is ignored: weather and sun come from Open-Meteo "
+                  "at DASH_LAT/DASH_LON", flush=True)
+    if not (DASH_LAT and DASH_LON):
+        print("[config] DASH_LAT/DASH_LON not set: no weather, forecast, rain, or sun", flush=True)
+    threading.Thread(target=data_poll_loop, daemon=True).start()
     if CLAUDE_REFRESH_TOKEN or os.path.exists(TOKEN_FILE):
         threading.Thread(target=usage_poll_loop, daemon=True).start()
     if CODEX_REFRESH_TOKEN or os.path.exists(CODEX_TOKEN_FILE):

@@ -16,24 +16,34 @@ All renderer config is environment variables (in `renderer/.env`; see `.env.exam
 
 > **All visual options live here, not on the device.** Rotation, dark mode, and the widget set are container env — the Kindle only ever opens the bare `GET /dash.png`. Change a knob, recreate the container, done; nothing to touch on the Kindle.
 
-## Home Assistant (weather · forecast · rain · sun · agenda)
+## Weather (weather · forecast · rain · sun)
+
+From [Open-Meteo](https://open-meteo.com): free, no API key, no account. One request each `DASH_POLL_MIN` gets the current weather, the daily forecast, the hourly rain chance, and the sunrise/sunset times. It sends only the coordinates below. If the request fails, the panels show their placeholders (`weather n/a`, `rain n/a`), and an hour with no rain chance shows `—`.
+
+| Var | Default | Notes |
+|---|---|---|
+| `DASH_LAT` / `DASH_LON` | blank | location, decimal degrees (e.g. `-23.55` / `-46.63`). Blank = weather, forecast, rain, and sun are off. `RAIN_LAT` / `RAIN_LON` are the old names and still work. |
+| `DASH_UNITS` | `metric` | `metric` (°C) or `imperial` (°F) |
+| `FORECAST_DAYS` | `3` | days in the forecast strip, from today |
+| `RAIN_HOURS` | `12` | hours in the rain chart (from the current hour) |
+| `DASH_POLL_MIN` | `5` | minutes between weather and agenda refreshes |
+| `OPEN_METEO_URL` | `https://api.open-meteo.com/v1/forecast` | override only for a self-hosted Open-Meteo |
+
+Conditions use the Home Assistant names (`sunny`, `clear-night`, `partlycloudy`, `cloudy`, `fog`, `rainy`, `pouring`, `snowy`, `snowy-rainy`, `lightning`, `lightning-rainy`), mapped from Open-Meteo's WMO weather codes.
+
+> **Moving from Home Assistant weather:** `HA_WEATHER_ENTITY` and `HA_SUN_ENTITY` are no longer used. If one is set, the renderer logs a warning at start and ignores it. Set `DASH_LAT`/`DASH_LON` to your home coordinates (HA → Settings → System → General shows them).
+
+## Home Assistant (agenda)
 
 Optional. Create a long-lived token: HA → Profile → Security → Long-lived access tokens.
 
 | Var | Example | Powers |
 |---|---|---|
-| `HA_BASE_URL` | `http://192.168.1.5:8123` | all HA panels (blank = all off) |
+| `HA_BASE_URL` | `http://192.168.1.5:8123` | the agenda (blank = off) |
 | `HA_TOKEN` | `eyJ…` | auth |
-| `HA_WEATHER_ENTITY` | `weather.home` | weather, the forecast strip, **and** the rain chart |
 | `HA_CALENDAR_ENTITY` | `calendar.personal,calendar.work` | agenda (blank = hidden). Comma list: events from every calendar merge into one time-sorted list, and an event on more than one calendar shows once. An event with no title (for example from a calendar shared as free/busy only) shows as `busy`. |
-| `HA_SUN_ENTITY` | `sun.sun` | sunrise/sunset |
-| `FORECAST_DAYS` | `3` | days in the forecast strip |
-| `RAIN_HOURS` | `12` | hours in the rain chart (from the current hour) |
-| `RAIN_LAT` / `RAIN_LON` | HA home location | location for the Open-Meteo rain fallback (below) |
 | `DASH_MAX_EVENTS` | `4` | agenda rows |
 | `DASH_EVENT_GRACE_MIN` | `15` | minutes after its start that a timed event stays on the agenda (an 08:00 event shows until 08:15). An overnight event (`→HH:MM`) hides this long after its end. All-day events stay all day. |
-
-Forecast uses HA's `weather.get_forecasts` service; if your weather integration doesn't support daily forecasts, the strip just hides. The rain chart uses the same service with `type: hourly` and reads `precipitation_probability`. Some integrations (e.g. the default Met.no) give only the rain amount, not the probability; then the chart gets the probability from [Open-Meteo](https://open-meteo.com) instead (free, no API key), at HA's home location or `RAIN_LAT`/`RAIN_LON`. This is the only call that leaves your network for weather. If neither source answers it shows `rain n/a`, and an hour with no probability shows `—`.
 
 ## Claude usage (5h / 7d / Extra)
 
