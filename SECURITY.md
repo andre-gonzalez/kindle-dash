@@ -56,6 +56,10 @@ Opt-in: leave `OPENROUTER_MANAGEMENT_KEY` blank and none of it runs.
 
 A private ICS URL (for example Google's "secret address in iCal format") gives read access to the full calendar to anyone who has it. Treat each `DASH_ICS_URLS` entry as a credential: keep it in `renderer/.env` or your secret store, not in a committed compose file. The renderer never logs the URLs; a failed feed is logged by its number (`[ics] calendar 2 failed: HTTP 404`). If a URL leaks, reset it in the calendar settings (Google: "Reset" next to the secret address).
 
+## Geo-IP sends the Kindle's IP to third parties
+
+For the travel location, the Kindle asks `api.ipify.org` (then `ifconfig.me`) for its public IP over plain HTTP, and the renderer sends that IP to `ipapi.co` and its own IP to `api.ipify.org`. These services see the IPs, and thus a coarse location of the Kindle. Open-Meteo sees the coordinates of the weather location. To keep the IP to yourself, set `IP_URLS=` in `dashboard.sh` or `DASH_GEOIP_URL=` on the renderer, and use the `/location` page instead. `location.json` in `/data` holds the override and the last geo-IP location (at most 24 hours old).
+
 ## Token handling
 
 - The refresh token is a credential. Keep `renderer/.env` out of git (it's in `.gitignore`) and off shared storage; use your platform's secret mechanism if you have one.

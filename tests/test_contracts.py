@@ -6,6 +6,7 @@ import json
 import pathlib
 import tempfile
 import threading
+import time
 import unittest
 import zoneinfo
 from datetime import datetime, timedelta, timezone
@@ -167,12 +168,14 @@ class LocationContract(unittest.TestCase):
         self.path = str(pathlib.Path(tmp.name, "location.json"))
         for name, value in {
             "LOCATION_FILE": self.path, "HOME": HOME, "GEO_LOCATION": None,
-            "LOCATION": {"override": None, "last": None},
+            "LOCATION": {"override": None, "last": None, "last_saved": None},
+            "KINDLE_IP": None, "_GEOIP_CACHE": {}, "_OWN_IP": (0.0, None),
         }.items():
             patcher = mock.patch.object(app, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
         app.POLL_WAKE.clear()
+        app.GEOIP_WAKE.clear()
 
     def test_priority_is_override_geoip_last_home(self):
         last = {**LISBON, "name": "Porto"}
@@ -195,12 +198,113 @@ class LocationContract(unittest.TestCase):
 
     def test_override_and_last_survive_a_restart(self):
         app.update_location(override=TOKYO, last=LISBON)
-        self.assertEqual(app.load_location(self.path), {"override": TOKYO, "last": LISBON})
+        loaded = app.load_location(self.path)
+        self.assertEqual((loaded["override"], loaded["last"]), (TOKYO, LISBON))
+        self.assertAlmostEqual(loaded["last_saved"], time.time(), delta=5)
         # A damaged or hand-edited file gives no location, not a crash.
+        empty = {"override": None, "last": None, "last_saved": None}
         pathlib.Path(self.path).write_text('{"override": {"lat": "x"}, "last": 3}')
-        self.assertEqual(app.load_location(self.path), {"override": None, "last": None})
+        self.assertEqual(app.load_location(self.path), empty)
         pathlib.Path(self.path).write_text("not json")
-        self.assertEqual(app.load_location(self.path), {"override": None, "last": None})
+        self.assertEqual(app.load_location(self.path), empty)
+
+    def test_last_location_expires_after_a_day(self):
+        # The ipapi.co terms allow no copy older than 24 h.
+        app.update_location(last=LISBON, last_saved=time.time() - 25 * 3600)
+        self.assertEqual(app.current_location(), HOME)
+        self.assertIsNone(app.load_location(self.path)["last"])
+        app.update_location(last=LISBON, last_saved=time.time() - 23 * 3600)
+        self.assertEqual(app.current_location(), LISBON)
+
+    def test_public_ip_accepts_only_global_addresses(self):
+        for text, ip in {
+            "8.8.8.8": "8.8.8.8", " 8.8.8.8\n": "8.8.8.8",
+            "2001:4860:4860::8888": "2001:4860:4860::8888",
+            "192.168.0.10": None, "10.0.0.1": None, "127.0.0.1": None,
+            "100.64.1.1": None,  # CGNAT, and the Tailscale range
+            "203.0.113.7": None,  # documentation range
+            "8.8.8.8.8": None, "not-an-ip": None, "": None,
+        }.items():
+            self.assertEqual(app.public_ip(text), ip, text)
+
+    def test_geoip_fixture(self):
+        data = json.loads((FIXTURES / "ipapi-geoip.json").read_text())
+        self.assertEqual(app.parse_geoip(data), {
+            "lat": 37.42301, "lon": -122.083352, "tz": "America/Los_Angeles",
+            "name": "Mountain View", "source": "geoip",
+        })
+        reserved = {"ip": "192.168.0.1", "error": True, "reason": "Reserved IP Address"}
+        self.assertIsNone(app.parse_geoip(reserved))
+        self.assertIsNone(app.parse_geoip({"error": True, "reason": "RateLimited"}))
+        self.assertIsNone(app.parse_geoip({"city": "X"}))  # no coordinates
+
+    def test_geoip_lookup_is_cached_for_each_ip(self):
+        answer = mock.Mock()
+        answer.json.return_value = json.loads((FIXTURES / "ipapi-geoip.json").read_text())
+        t = 1_000_000.0
+        with mock.patch.object(app.requests, "get", return_value=answer) as get:
+            loc, fetched = app.geoip_lookup("8.8.8.8", now=t)
+            self.assertEqual((loc["name"], fetched), ("Mountain View", t))
+            self.assertEqual(app.geoip_lookup("8.8.8.8", now=t + 3600), (loc, t))
+            self.assertEqual(get.call_count, 1)
+            self.assertIn("/8.8.8.8/", get.call_args.args[0])
+            # ipapi.co rate-limits the default python-requests User-Agent.
+            self.assertEqual(get.call_args.kwargs["headers"]["User-Agent"], "kindle-dash")
+            app.geoip_lookup("8.8.8.8", now=t + 13 * 3600)  # older than 12 h: again
+            self.assertEqual(get.call_count, 2)
+        # A failed lookup waits 15 minutes before it tries the same IP again.
+        with (
+            mock.patch.object(app.requests, "get", side_effect=app.requests.ConnectionError("x")) as get,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(app.geoip_lookup("1.1.1.1", now=t), (None, t))
+            app.geoip_lookup("1.1.1.1", now=t + 600)
+            self.assertEqual(get.call_count, 1)
+            app.geoip_lookup("1.1.1.1", now=t + 1000)
+            self.assertEqual(get.call_count, 2)
+
+    def test_the_home_network_gives_the_home_location(self):
+        own = mock.Mock(text="8.8.8.8\n")
+        with (
+            mock.patch.object(app.requests, "get", return_value=own) as get,
+            mock.patch.object(app, "geoip_lookup", return_value=(LISBON, 5.0)) as lookup,
+        ):
+            self.assertEqual(app.locate("8.8.8.8")[0], HOME)
+            lookup.assert_not_called()
+            self.assertEqual(app.locate("1.1.1.1"), (LISBON, 5.0))
+            self.assertEqual(get.call_count, 1)  # the own IP is cached
+
+    def test_geoip_location_sets_the_last_location(self):
+        app.set_geo_location(LISBON, fetched=time.time() - 60)
+        self.assertEqual(app.current_location(), LISBON)
+        self.assertTrue(app.POLL_WAKE.is_set())
+        self.assertEqual(app.load_location(self.path)["last"], LISBON)
+        # A failed lookup (unknown) keeps the last location, not home.
+        app.set_geo_location(None)
+        self.assertEqual(app.current_location(), LISBON)
+        # Home clears the last location.
+        app.set_geo_location(HOME)
+        self.assertEqual(app.current_location(), HOME)
+        app.set_geo_location(None)
+        self.assertEqual(app.current_location(), HOME)
+        # The override still wins over geo-IP.
+        app.update_location(override=TOKYO)
+        app.set_geo_location(LISBON)
+        self.assertEqual(app.current_location(), TOKYO)
+
+    def test_dash_png_records_the_kindle_ip(self):
+        with mock.patch.object(app, "render", return_value=b"png"):
+            self.assertEqual(self.request("GET", "/dash.png?battery=80&ip=8.8.8.8")[0], 200)
+            self.assertEqual(app.KINDLE_IP, "8.8.8.8")
+            self.assertTrue(app.GEOIP_WAKE.is_set())
+            app.GEOIP_WAKE.clear()
+            for query in ("ip=8.8.8.8", "ip=192.168.0.2", "ip=bad", "battery=80", ""):
+                self.request("GET", f"/dash.png?{query}")
+            self.assertEqual(app.KINDLE_IP, "8.8.8.8")  # no new, valid IP: no change
+            self.assertFalse(app.GEOIP_WAKE.is_set())
+            with mock.patch.object(app, "DASH_GEOIP_URL", ""):  # geo-IP off
+                self.request("GET", "/dash.png?ip=1.1.1.1")
+            self.assertEqual(app.KINDLE_IP, "8.8.8.8")
 
     def test_a_location_change_wakes_the_poll(self):
         app.update_location(last=None)  # no change

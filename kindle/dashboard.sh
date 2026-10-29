@@ -22,6 +22,15 @@ DASH_PROXY="${DASH_PROXY:-}"
 # The plugin's binaries. KOReader starts tailscaled on open; after a reboot
 # straight into KUAL nothing has, so we start it from here (see ensure_tailscale).
 TS_BIN="${TS_BIN:-/mnt/us/koreader/plugins/tailscale.koplugin/bin}"
+# Public IP lookup, for the renderer's geo-IP location: the weather and the time
+# follow the Kindle when it travels. Plain-HTTP services that answer with the
+# bare IP, tried in order. Direct, not through DASH_PROXY: the renderer must see
+# the network the Kindle is on. IPv4 only (-4): the renderer compares it with
+# its own public IPv4 to detect home. Empty = do not send an IP.
+IP_URLS="${IP_URLS-http://api.ipify.org http://ifconfig.me/ip}"
+IP_EVERY=15        # look up again every N cycles (and when the Wi-Fi network changes)
+PUBLIC_IP=""
+LAST_ESSID=""
 IMG="/tmp/dash.png"
 LOG="${LOG:-/tmp/kindle-dash.log}"
 FULL_EVERY=30      # full flashing refresh every N cycles (here: 30 min) to de-ghost
@@ -122,11 +131,34 @@ battery_query() {
   echo "battery=$lvl&charging=$chg"
 }
 
+# Refresh PUBLIC_IP at the first cycle, when the Wi-Fi network name changes,
+# and every IP_EVERY cycles ($1 = cycle number). A failed lookup clears it
+# (the renderer then keeps its location) and tries again next cycle.
+update_public_ip() {
+  [ -n "$IP_URLS" ] || return 0
+  essid=$(lipc-get-prop com.lab126.wifid currentEssid 2>/dev/null)
+  if [ -n "$PUBLIC_IP" ] && [ "$essid" = "$LAST_ESSID" ] && [ $(($1 % IP_EVERY)) -ne 0 ]; then
+    return 0
+  fi
+  LAST_ESSID="$essid"
+  PUBLIC_IP=""
+  for u in $IP_URLS; do
+    ip=$(curl -4 -s -m 5 "$u" 2>/dev/null)
+    case "$ip" in
+      ''|*[!0-9.]*) continue ;;  # not a bare IPv4 (an error page, IPv6)
+    esac
+    PUBLIC_IP="$ip"
+    return 0
+  done
+  echo "public IP lookup failed; next cycle tries again"
+}
+
 fetch() {
   url="$URL"
-  b=$(battery_query)
-  if [ -n "$b" ]; then
-    case "$URL" in *\?*) url="$URL&$b" ;; *) url="$URL?$b" ;; esac
+  q=$(battery_query)
+  [ -n "$PUBLIC_IP" ] && q="${q:+$q&}ip=$PUBLIC_IP"
+  if [ -n "$q" ]; then
+    case "$URL" in *\?*) url="$URL&$q" ;; *) url="$URL?$q" ;; esac
   fi
   if [ -n "$DASH_PROXY" ]; then
     curl -s -m 30 -x "$DASH_PROXY" -o "$IMG" "$url"
@@ -157,6 +189,7 @@ i=0
 while true; do
   # cheap when it's already up; restarts it if it died (or after a reboot)
   ensure_tailscale
+  update_public_ip "$i"
   if fetch; then
     if [ $((i % FULL_EVERY)) -eq 0 ]; then paint 1; else paint 0; fi
   fi

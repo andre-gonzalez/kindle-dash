@@ -44,6 +44,14 @@ The weather, the time zone, and a small city line under the weather follow the *
 
 Away from home, the clock, the agenda day, the sun times, the rain hours, and the usage reset times use the location's time zone. The city line shows the location name, with `(manual)` for an override. At home there is no city line, so the home dashboard looks the same as before.
 
+**Geo-IP.** `dashboard.sh` looks up the Kindle's public IPv4 (direct, not over Tailscale) and sends it as `ip=` with each fetch. The renderer looks it up at [ipapi.co](https://ipapi.co) (free, no key) and caches the result for each IP for 12 hours. If the Kindle's IP is the same as the renderer's own public IPv4, the Kindle is at home and the renderer uses `DASH_LAT`/`DASH_LON`, not the less exact ISP city. The ipapi.co terms allow no copy older than 24 hours, so the last known location expires after 24 hours (then home). A phone hotspot can give a geo-IP city hundreds of kilometres away: set the city by hand in that case.
+
+| Var | Default | Notes |
+|---|---|---|
+| `DASH_GEOIP_URL` | `https://ipapi.co/{ip}/json/` | geo-IP lookup; `{ip}` is the Kindle's address. Another service must answer in the ipapi.co JSON format (`latitude`, `longitude`, `timezone`, `city`, `error`). Blank = geo-IP off (the `ip=` value is ignored). |
+| `DASH_PUBLIC_IP_URL` | `https://api.ipify.org` | the renderer's own public **IPv4** as plain text, for home detection (asked at most every 30 minutes) |
+| `DASH_GEOIP_USER_AGENT` | `kindle-dash` | ipapi.co rate-limits the default `python-requests` User-Agent |
+
 Set or clear the override on the [`/location` page](USAGE.md#set-the-location-by-hand-travel). Its city search uses the [Open-Meteo geocoding API](https://open-meteo.com/en/docs/geocoding-api) (free, no key; `GEOCODING_URL` overrides the endpoint). The override and the last known location persist in `location.json` in the state dir (`/data`), so a restart keeps them.
 
 ## Agenda (ICS calendars · Home Assistant)
@@ -138,3 +146,5 @@ Lists every key (disabled and expired included) and adds up `usage_monthly` — 
 | `TS_BIN` | `/mnt/us/koreader/plugins/tailscale.koplugin/bin` | where the plugin keeps `tailscaled` and its state; only used when `DASH_PROXY` is set |
 | `FULL_EVERY` | `30` | full (flashing) de-ghost refresh every N minute-cycles |
 | `LOG` | `/tmp/kindle-dash.log` | script log (kept off-screen) |
+| `IP_URLS` | `http://api.ipify.org http://ifconfig.me/ip` | plain-HTTP services that return the bare public IP, tried in order, for the [geo-IP location](#location). Asked with `curl -4`, direct (not through `DASH_PROXY`), at start, when the Wi-Fi network name changes, and every `IP_EVERY` cycles. Set to empty (`IP_URLS=`) to send no IP. |
+| `IP_EVERY` | `15` | look up the public IP again every N minute-cycles |
