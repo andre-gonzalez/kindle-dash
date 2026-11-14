@@ -1,7 +1,7 @@
 # kindle-dash — renders a grayscale dashboard PNG for a jailbroken Kindle.
 # Pulls time, optional Home Assistant data (weather/forecast/sun/calendar) and
 # optional Claude usage, and serves it at GET /dash.png for the device to fetch.
-FROM python:3.14-slim
+FROM python:3.15-slim
 
 # tzdata: local time/date on the dashboard. fonts-dejavu-core: TTFs Pillow draws
 # with (slim ships none). Both are tiny.
